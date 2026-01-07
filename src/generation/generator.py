@@ -2,11 +2,54 @@
 
 import json
 import logging
+import re
 from typing import Optional, Dict, Any
 
 from ..api.client import OpenRouterClient
-from ..models.schemas import PhysicsQADataPoint, Rubric, RubricCriterion, PhysicsTopic
+from ..models.schemas import PhysicsQADataPoint, Rubric, PhysicsTopic
 from .topics import TopicContext
+
+
+def extract_json_from_response(content: str) -> dict:
+    """
+    Extract JSON from a response that may contain markdown or other text.
+
+    Handles cases like:
+    - Pure JSON: {"key": "value"}
+    - Markdown wrapped: ```json\n{"key": "value"}\n```
+    - Text before/after JSON: "Here is the result: {"key": "value"}"
+    """
+    content = content.strip()
+
+    # Try direct parse first
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        pass
+
+    # Try to extract from markdown code blocks
+    json_block_pattern = r'```(?:json)?\s*\n?([\s\S]*?)\n?```'
+    matches = re.findall(json_block_pattern, content)
+    for match in matches:
+        try:
+            return json.loads(match.strip())
+        except json.JSONDecodeError:
+            continue
+
+    # Try to find JSON object in the text (find first { and last })
+    first_brace = content.find('{')
+    last_brace = content.rfind('}')
+    if first_brace != -1 and last_brace > first_brace:
+        try:
+            return json.loads(content[first_brace:last_brace + 1])
+        except json.JSONDecodeError:
+            pass
+
+    # Nothing worked, raise error with content preview
+    raise json.JSONDecodeError(
+        f"Could not extract JSON from response: {content[:200]}...",
+        content, 0
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -21,67 +64,89 @@ Your problems:
 - Test whether students can apply theory to concrete physical situations
 - Have clear, unambiguous setups with all necessary information provided
 - Reward correct physical reasoning and mathematical execution
+- Are CHALLENGING - they should NOT be solvable by pattern-matching or simple formula application
 
 All mathematical expressions use plain text (e.g., "x^2", "sqrt(x)", "integral from 0 to infinity", "partial derivative of f with respect to x")."""
 
     GENERATION_PROMPT = """Create a PhD qualifying exam question about {topic_context}.
 
-The problem should:
-- Be appropriate for a first-year physics PhD student
-- Present a specific physical scenario (not a generic textbook exercise)
-- Require graduate-level analysis and problem-solving
-- Have a definite numerical or analytical answer
-- Ensure that it is humanly possible to answer the question
+QUESTION TYPE: Pure derivation/calculation problem
+- The question must be solvable through mathematical derivation from first principles
+- NO questions about physical effects, corrections, or perturbations where the answer depends on interpretation
+- NO questions about "what happens when X" or "estimate the effect of Y"
+- YES to: "Derive an expression for X", "Calculate Y given Z", "Show that X equals Y"
+
+QUESTION FORMAT:
+- A single cohesive question written as flowing prose (NOT labeled parts like (a), (b), (c))
+- The question can involve multiple reasoning steps, but asks for ONE final answer
+
+ANSWER FORMAT (CRITICAL):
+- The final answer MUST be symbolic, a ratio, or a simple integer/fraction
+- Express answers in terms of given variables (m, ω, ℏ, k, etc.) NOT as decimal numbers
+- Good: "4/3", "2π", "mω²R²/2", "n(n+1)ℏ²", "E₀/4"
+- Bad: "1.333", "6.28", "0.0023 J", "82 nanobarns"
+- The answer must follow UNIQUELY from the problem setup - no judgment calls
+
+DIFFICULTY CALIBRATION:
+Make it hard through mathematical complexity, NOT through subtle physics effects.
+
+What makes it hard:
+- Requires careful setup of boundary conditions or constraints
+- Involves non-trivial integration, series expansion, or algebraic manipulation
+- Multiple steps where errors compound
+- Requires recognizing the right mathematical technique to apply
+
+What keeps it solvable:
+- All information needed is explicitly stated in the problem
+- Standard physics (mechanics, E&M, QM, stat mech) - not cutting-edge topics
+- The derivation follows a clear logical path
+- You can verify your answer is correct with 100% confidence
+
+GOOD QUESTION PATTERNS:
+- "Derive the expression for X in terms of Y and Z"
+- "A system has Hamiltonian H = ... Find the eigenvalues"
+- "Given potential V(r) = ..., calculate the bound state energies"
+- "Show that the ratio X/Y equals ..."
+- "For a particle in ... find the probability that ..."
+
+AVOID:
+- Questions about thermal corrections, perturbative effects, or small parameters
+- Questions where the answer depends on which terms you keep/drop
+- "Estimate" or "approximate" questions
+- Questions about real physical systems (use idealized setups)
+- Questions that reference a figure, diagram, or image
+- Standard textbook problems (even with different numbers)
 
 Respond with JSON:
 {{
     "query": "The complete problem statement with all necessary information.",
-    "response_answer": "The final answer with numerical value/expression and units.",
+    "response_answer": "The symbolic/ratio answer (e.g., '4/3', 'mω²R²/2', 'n+1'). NO decimals.",
     "response_reasoning": "Complete worked solution showing the physics reasoning, key equations, mathematical steps, and final calculation.",
     "rubric": {{
-        "total_points": 100,
-        "criteria": [
-            {{
-                "criterion": "Physical concepts and approach",
-                "max_points": 25,
-                "description": "Correctly identifies the relevant physics and chooses an appropriate solution method."
-            }},
-            {{
-                "criterion": "Mathematical formulation",
-                "max_points": 25,
-                "description": "Sets up the correct equations with appropriate approximations where needed."
-            }},
-            {{
-                "criterion": "Solution execution",
-                "max_points": 25,
-                "description": "Carries out the mathematical derivation correctly."
-            }},
-            {{
-                "criterion": "Final result",
-                "max_points": 15,
-                "description": "Arrives at the correct answer with proper units."
-            }},
-            {{
-                "criterion": "Physical insight",
-                "max_points": 10,
-                "description": "Demonstrates understanding of the physics behind the mathematics."
-            }}
-        ],
-        "passing_threshold": 70
+        "correct_physics": "What physical principles/laws must be correctly identified and applied (e.g., 'Must use conservation of energy and angular momentum')",
+        "correct_answer": "The expected answer and any equivalent forms (e.g., 'mω²R²/2 or equivalent expression for kinetic energy')",
+        "sound_reasoning": "What mathematical/logical steps are required (e.g., 'Must set up the Lagrangian, derive equations of motion, and solve for the period')"
     }},
     "response_images": []
 }}"""
 
-    def __init__(self, client: OpenRouterClient, model: str):
+    def __init__(
+        self,
+        client: OpenRouterClient,
+        model: str,
+        judge_model: str = "anthropic/claude-sonnet-4",
+    ):
         """
         Initialize the QA generator.
 
         Args:
             client: OpenRouter API client
             model: Model identifier for generation
+            judge_model: Model to use for judging (used by validators, not generator)
         """
         self.client = client
         self.model = model
+        self.judge_model = judge_model
 
     async def generate(
         self,
@@ -95,7 +160,7 @@ Respond with JSON:
         Args:
             topic_context: The topic context to generate for
             temperature: Sampling temperature (higher = more diverse)
-            max_retries: Number of retries for failed generation/parsing
+            max_retries: Number of retries for failed JSON parsing
 
         Returns:
             PhysicsQADataPoint with the generated QA pair
@@ -111,25 +176,19 @@ Respond with JSON:
                         {"role": "user", "content": prompt},
                     ],
                     temperature=temperature,
-                    max_tokens=16384,
+                    max_tokens=32768,
                     response_format={"type": "json_object"},
                 )
 
                 content = response["choices"][0]["message"]["content"]
-                data = json.loads(content)
+                data = extract_json_from_response(content)
 
                 # Build the rubric
                 rubric_data = data.get("rubric", {})
-                criteria = [
-                    RubricCriterion(**c) for c in rubric_data.get("criteria", [])
-                ]
-
-                # Ensure criteria sum to total_points
-                total_from_criteria = sum(c.max_points for c in criteria)
                 rubric = Rubric(
-                    total_points=total_from_criteria,  # Use actual sum
-                    criteria=criteria,
-                    passing_threshold=rubric_data.get("passing_threshold", 60),
+                    correct_physics=rubric_data.get("correct_physics", ""),
+                    correct_answer=rubric_data.get("correct_answer", ""),
+                    sound_reasoning=rubric_data.get("sound_reasoning", ""),
                 )
 
                 # Create the data point
@@ -161,7 +220,7 @@ Respond with JSON:
                 if attempt == max_retries - 1:
                     raise
 
-        raise RuntimeError("Unexpected end of retry loop")
+        raise RuntimeError(f"Failed to generate QA after {max_retries} attempts")
 
     async def generate_batch(
         self,
@@ -223,7 +282,13 @@ ORIGINAL ANSWER:
 ORIGINAL REASONING:
 {original.response_reasoning}
 
-Please generate an improved version that addresses the feedback while maintaining graduate-level difficulty. Respond with the same JSON format as before.
+CRITICAL CONSTRAINTS (must follow):
+1. The question must be a SINGLE cohesive question - NO labeled parts like (a), (b), (c)
+2. The answer must be SYMBOLIC (e.g., "mω²R²/2", "4/3", "exp(-x²)") - NO decimal numbers
+3. The question must be self-contained with all information needed to solve it
+4. NO references to figures, diagrams, or images
+
+Please generate an improved version that addresses the feedback while following all constraints above. Respond with JSON only.
 
 {{
     "query": "Improved question...",
@@ -252,7 +317,7 @@ Please generate an improved version that addresses the feedback while maintainin
                         {"role": "user", "content": improvement_prompt},
                     ],
                     temperature=temperature,
-                    max_tokens=16384,
+                    max_tokens=32768,
                     response_format={"type": "json_object"},
                 )
 

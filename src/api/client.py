@@ -360,10 +360,31 @@ class OpenRouterClient:
                 )
                 await asyncio.sleep(wait_time)
 
+            except asyncio.TimeoutError as e:
+                last_error = e
+                # Timeout - retry with backoff
+                base_wait = min((2**attempt) + random.uniform(0, 2), 30)
+                wait_time = base_wait * model_retry_multiplier
+                logger.warning(
+                    f"Timeout on {model} ({provider}), retrying in {wait_time:.1f}s "
+                    f"(attempt {attempt + 1}/{self.max_retries})"
+                )
+                await asyncio.sleep(wait_time)
+
             except Exception as e:
                 last_error = e
-                logger.error(f"Unexpected error on {model} ({provider}): {e}")
-                break
+                # For Grok and other flaky models, retry on unexpected errors too
+                if is_grok or "timeout" in str(e).lower() or "connection" in str(e).lower():
+                    base_wait = min((2**attempt) + random.uniform(1, 3), 30)
+                    wait_time = base_wait * model_retry_multiplier
+                    logger.warning(
+                        f"Error on {model} ({provider}): {e}, retrying in {wait_time:.1f}s "
+                        f"(attempt {attempt + 1}/{self.max_retries})"
+                    )
+                    await asyncio.sleep(wait_time)
+                else:
+                    logger.error(f"Unexpected error on {model} ({provider}): {e}")
+                    break
 
         # Record failed metric
         end_time = time.monotonic()

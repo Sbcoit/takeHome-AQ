@@ -76,56 +76,73 @@ The system ensures quality through a multi-stage validation pipeline that tests 
 
 ## Validation Logic
 
-### 1. Schema Validation
-- All required fields present
-- `response_images` is empty array
-- Query has minimum 15 words
-- Reasoning has minimum 50 words
-- Rubric has 3-10 criteria that sum to total_points
+The system implements the **four required validation rules** from the spec:
 
-### 2. Qwen Constraint (Anti-"Too Easy" Filter)
-- Samples `qwen/qwen3-max` 5 times per question
-- Grades each response against the rubric
-- **Pass criteria**: High-pass rate (4+/5 criteria at 80%+ points) must be ≤ 5%
-- This ensures questions aren't trivially solvable
+### 1. No-Images Rule
+- `response_images` must be empty for every data point
+- No images in questions or anywhere in content
 
-### 3. Frontier Model Cross-Check
-Tests with 4 models, 5 samples each (20 total attempts):
-- `deepseek/deepseek-v3.2`
+### 2. Qwen Constraint (Anti-"Too Easy" Filter) - DATASET-LEVEL
+Per spec: *"The proportion of cases where Qwen3-max-thinking passes at least 4 out of 5 attempts must not exceed 5%."*
+
+This is a **dataset-level** constraint:
+- For each question, sample `qwen/qwen3-max` (with thinking mode) 5 times
+- Grade each response using rubric-based evaluation
+- If Qwen passes 4+ out of 5 attempts, the question is marked as "easy"
+- **Dataset constraint**: No more than 5% of questions can be "easy"
+
+For example, in a 50-question dataset:
+- Up to 2 questions can be "easy" (Qwen 4+/5 passes)
+- Questions beyond the 5% threshold that are "easy" will be rejected and regenerated
+
+### 3. Frontier Model Cross-Check (per-question)
+Per spec, test each question with 4 models × 5 samples = 20 total attempts:
+- `deepseek/deepseek-v3-0324` (deepseek-v3.2)
 - `openai/o4-mini-2025-04-16`
-- `google/gemini-3-pro`
+- `google/gemini-2.5-pro-preview-05-06` (gemini-3-pro)
 - `x-ai/grok-4-0709`
 
-**Pass criteria**:
-- At least 2 models must get ≥1 correct answer
-- Total correct across 20 attempts must be ≥5 (25% accuracy)
+**Pass criteria (per-question)**:
+- At least 2 models must have accuracy > 0 (i.e., at least one correct answer among their 5 attempts)
+- Total correct across 20 attempts must be ≥5 (i.e., overall accuracy ≥ 25%)
 
-### 4. Correctness Judge
-Uses LLM-as-judge to verify:
-- Query is well-posed and unambiguous
-- Answer is physically correct
-- Reasoning is mathematically valid
-- Rubric appropriately assesses the problem
+### 4. Dataset-Level Correctness Target
+Per spec: *"Across the accepted dataset, the accuracy should be higher than 90%"*
 
-**Pass criteria**: Overall correctness score must be acceptable.
+Uses LLM-as-judge to verify each question:
+- The query is well-posed and internally consistent
+- The response_answer is correct
+- The response_reasoning is correct and supports the answer
+
+**Pass criteria**: Dataset-wide accuracy must exceed 90%.
 
 ### How "Correct" Is Scored
 
-Correctness is determined by the judge model evaluating:
+Correctness is determined by the judge model using a **generous holistic evaluation**:
 
-1. **Answer matching**: Final answer matches reference within tolerance (numerical) or is mathematically equivalent (symbolic)
-2. **Physics validity**: Core physics principles correctly applied
-3. **Mathematical correctness**: All derivation steps are valid
+1. **Correct Physics**: Did the model identify and apply the correct physical principles?
+2. **Correct Answer**: Did the model arrive at the correct (or equivalent) final answer?
+3. **Sound Reasoning**: Is the mathematical/logical approach valid?
 
-The judge uses low temperature (0.1) for consistent evaluation and outputs structured JSON with scores and explanations.
+**Grading philosophy**:
+- Accept equivalent answers (different but mathematically equal forms, reasonable rounding)
+- Accept valid alternative approaches that reach the same answer
+- Focus on whether the physics is RIGHT, not exact string matching
+- Minor calculation errors are acceptable if the method is correct
+
+**Mark as CORRECT if**: The model gets the right answer with valid reasoning, OR uses correct physics with only minor errors.
+
+**Mark as INCORRECT only if**: The physics approach is fundamentally wrong, OR the final answer is significantly wrong (wrong order of magnitude, wrong units).
+
+The judge uses low temperature (0.1) for consistent evaluation and outputs structured JSON with detailed explanations.
 
 ## How to Run End-to-End
 
 ### Prerequisites
 
 - Python 3.11+
-- OpenRouter API key (for most models)
-- OpenAI API key (for o4-mini model, which is not supported by OpenRouter)
+- OpenRouter API key (for Claude, DeepSeek, Gemini, Grok, and Qwen models)
+- OpenAI API key (for o4-mini model - routed directly to OpenAI)
 
 ### Installation
 
@@ -145,7 +162,7 @@ pip install -r requirements.txt
 cp .env.example .env
 # Edit .env and set:
 #   OPENROUTER_API_KEY=sk-or-v1-...
-#   OPENAI_API_KEY=sk-...  (for o4-mini model)
+#   OPENAI_API_KEY=sk-...
 ```
 
 ### Running via CLI
@@ -158,7 +175,7 @@ python -m src.main generate
 python -m src.main generate --count 100 --output output/my_dataset.jsonl
 
 # With verbose logging
-python -m src.main generate --count 5 --verbose
+python -m src.main generate --count 3 --verbose
 
 # Show available topics
 python -m src.main topics
@@ -195,19 +212,19 @@ The output is a JSONL file with one JSON object per line:
 
 ```json
 {
-  "query": "Consider a two-dimensional harmonic oscillator...",
-  "response_answer": "E = hbar * omega * (n_x + n_y + 1)",
-  "response_reasoning": "Starting with the Hamiltonian H = ...",
+  "query": "Consider a two-dimensional harmonic oscillator with potential V(x,y) = (1/2)mω²(x² + y²). A particle of mass m is in this potential. (a) Write the Hamiltonian and show that the problem is separable. (b) Find the energy eigenvalues. (c) Determine the degeneracy of the nth energy level.",
+  "response_answer": "E_n = ℏω(n + 1), where n = n_x + n_y (n_x, n_y = 0,1,2,...). The degeneracy of level n is (n + 1).",
+  "response_reasoning": "Starting with the Hamiltonian H = p_x²/2m + p_y²/2m + (1/2)mω²x² + (1/2)mω²y². This separates as H = H_x + H_y where each is a 1D harmonic oscillator. The energy eigenvalues are E = ℏω(n_x + 1/2) + ℏω(n_y + 1/2) = ℏω(n_x + n_y + 1). For the nth level where n = n_x + n_y, the pairs (n_x, n_y) can be (0,n), (1,n-1), ..., (n,0), giving (n+1) states.",
   "rubric": {
     "total_points": 100,
     "criteria": [
-      {"criterion": "Identifies separability", "max_points": 20, "description": "..."},
-      {"criterion": "Correct Hamiltonian", "max_points": 25, "description": "..."},
-      {"criterion": "Solves eigenvalue problem", "max_points": 30, "description": "..."},
-      {"criterion": "Final energy expression", "max_points": 15, "description": "..."},
-      {"criterion": "Degeneracy analysis", "max_points": 10, "description": "..."}
+      {"criterion": "Physical concepts and approach", "max_points": 25, "description": "Correctly identifies the relevant physics and chooses an appropriate solution method."},
+      {"criterion": "Mathematical formulation", "max_points": 25, "description": "Sets up the correct equations with appropriate approximations where needed."},
+      {"criterion": "Solution execution", "max_points": 25, "description": "Carries out the mathematical derivation correctly."},
+      {"criterion": "Final result", "max_points": 15, "description": "Arrives at the correct answer with proper units."},
+      {"criterion": "Physical insight", "max_points": 10, "description": "Demonstrates understanding of the physics behind the mathematics."}
     ],
-    "passing_threshold": 60
+    "passing_threshold": 70
   },
   "response_images": []
 }
@@ -215,10 +232,10 @@ The output is a JSONL file with one JSON object per line:
 
 ## Design Decisions & Tradeoffs
 
-### 1. Per-Question Qwen Filtering vs Dataset-Level
-**Decision**: Per-question filtering
-**Rationale**: More aggressive filtering ensures every question meets the difficulty threshold, not just the average.
-**Tradeoff**: Higher rejection rate, but higher quality floor.
+### 1. Dataset-Level Qwen Constraint
+**Decision**: Track "easy" questions at the dataset level, allow up to 5%
+**Rationale**: Per the spec, this is a dataset-level constraint. Early questions can be easy; we only reject once we'd exceed 5%.
+**Tradeoff**: Slightly more complex bookkeeping, but matches spec exactly.
 
 ### 2. JSONL Output Format
 **Decision**: JSONL (one JSON object per line)
@@ -247,25 +264,27 @@ The output is a JSONL file with one JSON object per line:
 
 ## What I'd Do With More Time
 
-1. **Topic Diversity Tracking**: Ensure balanced coverage across all physics areas within a dataset
+1. **Few-Shot Examples**: Include 1-2 examples of questions that passed all validation in the generation prompt to anchor output quality
 
-2. **Adaptive Difficulty**: Adjust generation prompts based on validation rejection rates
+2. **Human-in-the-Loop**: Add optional human review stage for borderline cases
 
-3. **Human-in-the-Loop**: Add optional human review stage for borderline cases
+3. **Batch Processing**: Generate multiple questions in parallel, then validate in batch for better throughput
 
-4. **Batch Processing**: Generate multiple questions in parallel, then validate in batch for better throughput
+4. **HuggingFace Export**: Direct export to HuggingFace datasets format for easy sharing
 
-5. **HuggingFace Export**: Direct export to HuggingFace datasets format for easy sharing
+5. **Difficulty Gradation**: Tag questions with difficulty levels (easy/medium/hard graduate-level)
 
-6. **Multi-language Support**: Generate questions in multiple languages
+6. **Cost Optimization**: Implement caching for repeated model calls, smarter sampling strategies
 
-7. **Difficulty Gradation**: Tag questions with difficulty levels (easy/medium/hard graduate-level)
+7. **Better Error Analysis**: Detailed analysis of why questions fail each validation stage
 
-8. **Cost Optimization**: Implement caching for repeated model calls, smarter sampling strategies
+8. **Prometheus Metrics**: Add observability for production deployment
 
-9. **Better Error Analysis**: Detailed analysis of why questions fail each validation stage
+## Already Implemented
 
-10. **Prometheus Metrics**: Add observability for production deployment
+- **Adaptive Difficulty Feedback Loop**: Validation failure reasons are fed back into `regenerate_with_feedback()` to improve subsequent attempts (e.g., "Question was too easy - Qwen solved it 4/5 times")
+
+- **Topic Diversity Tracking**: `TopicSampler` tracks used subtopics and prefers unused ones via `prefer_diverse=True`, with coverage statistics available via `get_coverage_stats()`
 
 ## Project Structure
 

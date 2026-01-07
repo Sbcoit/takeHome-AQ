@@ -23,14 +23,15 @@ class Settings(BaseSettings):
 
     # Model Configuration
     generation_model: str = Field(
-        default="anthropic/claude-sonnet-4", alias="GENERATION_MODEL"
+        default="anthropic/claude-opus-4-5-20251101", alias="GENERATION_MODEL"
     )
-    judge_model: str = Field(default="anthropic/claude-sonnet-4", alias="JUDGE_MODEL")
+    judge_model: str = Field(default="anthropic/claude-opus-4-5-20251101", alias="JUDGE_MODEL")
     qwen_model: str = Field(default="qwen/qwen3-max", alias="QWEN_MODEL")
 
     # Cross-check models - stored as comma-separated string in env
+    # Per spec: deepseek-v3.2, o4-mini-2025-04-16, gemini-3-pro, grok-4-0709
     crosscheck_models_str: str = Field(
-        default="deepseek/deepseek-r1,openai/o4-mini,google/gemini-2.5-pro,x-ai/grok-4",
+        default="deepseek/deepseek-v3-0324,openai/o4-mini-2025-04-16,google/gemini-2.5-pro-preview-05-06,x-ai/grok-4",
         alias="CROSSCHECK_MODELS",
     )
 

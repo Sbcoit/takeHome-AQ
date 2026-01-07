@@ -61,12 +61,15 @@ class QwenConstraintValidator:
     Rule per document: "The proportion of cases where Qwen3-max-thinking passes
     at least 4 out of 5 attempts must not exceed 5%."
 
-    Interpretation:
+    Interpretation (DATASET-LEVEL constraint):
     - Run Qwen 5 times on each question
     - Grade each attempt as PASS or FAIL (based on rubric criteria)
-    - If Qwen passes >= 4 out of 5 attempts → question is TOO EASY (reject)
-    - The 5% threshold applies at dataset level, but for single question validation,
-      we reject any question where Qwen passes 4+ attempts.
+    - If Qwen passes >= 4 out of 5 attempts → question is "easy"
+    - Across the DATASET, no more than 5% of questions can be "easy"
+    - This means for a 50-question dataset, up to 2 questions can be easy
+
+    The validator returns whether a question is "easy" (4+/5 passes).
+    The pipeline decides whether to accept based on current easy question count.
     """
 
     ANSWER_PROMPT = """You are a physics graduate student taking a qualifying exam.
@@ -116,13 +119,14 @@ Mark as FAILED only if:
 - The physics approach is fundamentally wrong, OR
 - The final answer is significantly wrong (wrong order of magnitude, wrong units, wrong sign for a meaningful quantity)
 
-Respond with JSON:
+IMPORTANT: You MUST respond with ONLY a JSON object. Do not include any text before or after the JSON. Do not use markdown formatting. Do not analyze parts separately.
+
 {{
-    "correct_physics": {{"passed": true/false, "explanation": "..."}},
-    "correct_answer": {{"passed": true/false, "explanation": "..."}},
-    "sound_reasoning": {{"passed": true/false, "explanation": "..."}},
-    "passed": <true if student demonstrated understanding and got approximately correct answer>,
-    "explanation": "Brief overall explanation"
+    "correct_physics": {{"passed": true/false, "explanation": "one sentence"}},
+    "correct_answer": {{"passed": true/false, "explanation": "one sentence"}},
+    "sound_reasoning": {{"passed": true/false, "explanation": "one sentence"}},
+    "passed": true/false,
+    "explanation": "One sentence summary"
 }}"""
 
     def __init__(
@@ -357,14 +361,17 @@ Respond with JSON:
         pass_rate = high_pass_count / valid_attempts if valid_attempts > 0 else 0
 
         # Document rule: "passes at least 4 out of 5 attempts must not exceed 5%"
-        # For a single question: if Qwen passes 4+ out of 5 attempts, question is too easy
-        # (The 5% threshold applies at dataset level - we handle that in the pipeline)
-        min_passes_for_too_easy = 4  # If Qwen passes 4+ attempts, question is too easy
-        is_valid = high_pass_count < min_passes_for_too_easy
+        # This is a DATASET-LEVEL constraint, not per-question.
+        # We return whether the question is "easy" (4+/5), and let the pipeline
+        # decide whether to accept based on current easy question count.
+        min_passes_for_easy = 4  # If Qwen passes 4+ attempts, question is "easy"
+        is_easy = high_pass_count >= min_passes_for_easy
 
         logger.info(
             f"Qwen constraint: {high_pass_count}/{valid_attempts} attempts passed "
-            f"({pass_rate:.0%}). Too easy threshold: {min_passes_for_too_easy}+. Valid: {is_valid}"
+            f"({pass_rate:.0%}). Easy threshold: {min_passes_for_easy}+. Is easy: {is_easy}"
         )
 
-        return pass_rate, high_pass_count, is_valid, details
+        # Return is_easy (True if question is easy), NOT is_valid
+        # Pipeline will use this to track dataset-level 5% threshold
+        return pass_rate, high_pass_count, is_easy, details

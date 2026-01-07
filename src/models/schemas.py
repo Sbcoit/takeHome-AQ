@@ -1,6 +1,6 @@
 """Data models for the Physics QA system."""
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator
 from typing import List, Optional, Dict, Any
 from enum import Enum
 from datetime import datetime
@@ -24,50 +24,44 @@ class PhysicsTopic(str, Enum):
     FLUID_MECHANICS = "Fluid Mechanics"
 
 
-class RubricCriterion(BaseModel):
-    """A single criterion in a grading rubric."""
+class Rubric(BaseModel):
+    """
+    A simple pass/fail grading rubric for physics questions.
 
-    criterion: str = Field(..., description="What is being evaluated")
-    max_points: int = Field(..., ge=1, le=30, description="Maximum points for this criterion")
-    description: str = Field(..., description="How to award points for this criterion")
+    Three criteria, all pass/fail:
+    1. Correct Physics - Did the student apply the correct physical principles?
+    2. Correct Answer - Did they arrive at the correct (or equivalent) final answer?
+    3. Sound Reasoning - Is the mathematical/logical approach valid?
 
-    @field_validator("criterion")
+    A response passes if all three criteria are satisfied.
+    """
+
+    correct_physics: str = Field(
+        ...,
+        description="What physical principles/laws must be correctly identified and applied"
+    )
+    correct_answer: str = Field(
+        ...,
+        description="The expected answer (or equivalent forms) that constitutes a correct result"
+    )
+    sound_reasoning: str = Field(
+        ...,
+        description="What mathematical/logical steps are required for valid reasoning"
+    )
+
+    @field_validator("correct_physics", "correct_answer", "sound_reasoning")
     @classmethod
     def criterion_not_empty(cls, v: str) -> str:
         if not v.strip():
-            raise ValueError("Criterion cannot be empty")
+            raise ValueError("Rubric criterion cannot be empty")
         return v.strip()
-
-
-class Rubric(BaseModel):
-    """A complete grading rubric for a physics question."""
-
-    total_points: int = Field(..., ge=10, le=100, description="Total points possible")
-    criteria: List[RubricCriterion] = Field(
-        ..., min_length=3, max_length=10, description="Grading criteria"
-    )
-    passing_threshold: int = Field(..., description="Minimum points to pass")
-
-    @model_validator(mode="after")
-    def validate_points(self) -> "Rubric":
-        """Ensure criteria points sum to total and threshold is valid."""
-        criteria_sum = sum(c.max_points for c in self.criteria)
-        if criteria_sum != self.total_points:
-            raise ValueError(
-                f"Criteria points ({criteria_sum}) must equal total_points ({self.total_points})"
-            )
-        if self.passing_threshold > self.total_points:
-            raise ValueError("Passing threshold cannot exceed total points")
-        if self.passing_threshold < 1:
-            raise ValueError("Passing threshold must be at least 1")
-        return self
 
 
 class PhysicsQADataPoint(BaseModel):
     """A single physics QA data point - the core output format."""
 
     query: str = Field(..., min_length=50, description="The graduate-level physics question")
-    response_answer: str = Field(..., min_length=5, description="The final answer (concise)")
+    response_answer: str = Field(..., min_length=1, description="The final answer (concise)")
     response_reasoning: str = Field(
         ..., min_length=100, description="Step-by-step derivation/reasoning"
     )

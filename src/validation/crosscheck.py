@@ -117,13 +117,14 @@ Mark as INCORRECT only if:
 - The physics approach is fundamentally wrong, OR
 - The final answer is significantly wrong (wrong order of magnitude, wrong units, wrong sign for a meaningful quantity)
 
-Respond with JSON:
+IMPORTANT: You MUST respond with ONLY a JSON object. Do not include any text before or after the JSON. Do not use markdown formatting. Do not analyze parts separately.
+
 {{
-    "correct_physics": {{"passed": true/false, "explanation": "..."}},
-    "correct_answer": {{"passed": true/false, "explanation": "..."}},
-    "sound_reasoning": {{"passed": true/false, "explanation": "..."}},
-    "is_correct": <true if student demonstrated understanding and got approximately correct answer>,
-    "explanation": "Brief overall explanation"
+    "correct_physics": {{"passed": true/false, "explanation": "one sentence"}},
+    "correct_answer": {{"passed": true/false, "explanation": "one sentence"}},
+    "sound_reasoning": {{"passed": true/false, "explanation": "one sentence"}},
+    "is_correct": true/false,
+    "explanation": "One sentence summary"
 }}"""
 
     def __init__(
