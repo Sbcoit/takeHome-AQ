@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+
+{% block title %}QA #{{ index }} - Physics QA Generator{% endblock %}
+
+{% block content %}
+<div class="qa-detail">
+    <div class="qa-header">
+        <h1>QA Pair #{{ index + 1 }}</h1>
+        <div class="qa-nav">
+            {% if index > 0 %}
+            <a href="/qa/{{ index - 1 }}" class="btn btn-secondary">&larr; Previous</a>
+            {% endif %}
+            <a href="/" class="btn btn-secondary">Dashboard</a>
+            {% if index < total - 1 %}
+            <a href="/qa/{{ index + 1 }}" class="btn btn-secondary">Next &rarr;</a>
+            {% endif %}
+        </div>
+    </div>
+
+    <section class="qa-section">
+        <h2>Question</h2>
+        <div class="content-box query-box">
+            {{ qa.query }}
+        </div>
+    </section>
+
+    <section class="qa-section">
+        <h2>Answer</h2>
+        <div class="content-box answer-box">
+            {{ qa.response_answer }}
+        </div>
+    </section>
+
+    <section class="qa-section">
+        <h2>Solution / Reasoning</h2>
+        <div class="content-box reasoning-box">
+            <pre>{{ qa.response_reasoning }}</pre>
+        </div>
+    </section>
+
+    <section class="qa-section">
+        <h2>Grading Rubric</h2>
+        <div class="rubric-box">
+            <div class="rubric-header">
+                <span>Total Points: <strong>{{ qa.rubric.total_points }}</strong></span>
+                <span>Passing Threshold: <strong>{{ qa.rubric.passing_threshold }}</strong></span>
+            </div>
+            <table class="rubric-table">
+                <thead>
+                    <tr>
+                        <th>Criterion</th>
+                        <th>Max Points</th>
+                        <th>Description</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for criterion in qa.rubric.criteria %}
+                    <tr>
+                        <td>{{ criterion.criterion }}</td>
+                        <td class="points">{{ criterion.max_points }}</td>
+                        <td>{{ criterion.description }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </section>
+
+    <section class="qa-section">
+        <h2>Raw JSON</h2>
+        <details>
+            <summary>Click to expand</summary>
+            <pre class="json-box">{{ qa | tojson(indent=2) }}</pre>
+        </details>
+    </section>
+</div>
+{% endblock %}

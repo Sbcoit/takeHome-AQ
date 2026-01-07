@@ -1,0 +1,21 @@
+<div class="qa-items">
+    {% if items %}
+        {% for qa in items | reverse %}
+        <div class="qa-item">
+            <a href="/qa/{{ qa._index }}" class="qa-link">
+                <div class="qa-preview">
+                    <span class="qa-index">#{{ qa._index + 1 }}</span>
+                    <span class="qa-query">{{ qa.query[:100] }}...</span>
+                </div>
+                <div class="qa-meta">
+                    <span class="qa-points">{{ qa.rubric.total_points }} pts</span>
+                </div>
+            </a>
+        </div>
+        {% endfor %}
+    {% else %}
+    <div class="qa-item empty">
+        No QA pairs generated yet. Start generation to create physics questions.
+    </div>
+    {% endif %}
+</div>

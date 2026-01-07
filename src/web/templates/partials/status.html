@@ -1,0 +1,35 @@
+<div class="status-card {% if state.is_running %}running{% endif %}">
+    <div class="status-indicator">
+        {% if state.is_running %}
+        <span class="status-dot running"></span>
+        <span>Running</span>
+        {% elif state.error %}
+        <span class="status-dot error"></span>
+        <span>Error</span>
+        {% else %}
+        <span class="status-dot idle"></span>
+        <span>Idle</span>
+        {% endif %}
+    </div>
+
+    {% if state.is_running %}
+    <div class="progress-section">
+        <div class="progress-bar">
+            <div class="progress-fill" style="width: {{ state.progress_percent }}%"></div>
+        </div>
+        <span class="progress-text">{{ state.current_count }} / {{ state.target_count }} ({{ state.progress_percent }}%)</span>
+    </div>
+    {% endif %}
+
+    {% if state.error %}
+    <div class="error-message">
+        {{ state.error }}
+    </div>
+    {% endif %}
+
+    {% if state.run_id %}
+    <div class="run-info">
+        Run ID: <code>{{ state.run_id }}</code>
+    </div>
+    {% endif %}
+</div>

@@ -1,0 +1,9 @@
+<div class="logs-list">
+    {% if logs %}
+        {% for log in logs | reverse %}
+        <div class="log-entry">{{ log }}</div>
+        {% endfor %}
+    {% else %}
+    <div class="log-entry empty">No logs yet. Start generation to see activity.</div>
+    {% endif %}
+</div>

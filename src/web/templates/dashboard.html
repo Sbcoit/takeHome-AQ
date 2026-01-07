@@ -1,0 +1,105 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard - Physics QA Generator{% endblock %}
+
+{% block content %}
+<div class="dashboard">
+    <h1>Physics QA Generator Dashboard</h1>
+
+    <!-- Status Section -->
+    <section class="status-section"
+             hx-get="/partials/status"
+             hx-trigger="every 2s"
+             hx-swap="innerHTML">
+        {% include "partials/status.html" %}
+    </section>
+
+    <!-- Controls -->
+    <section class="controls-section">
+        <h2>Generation Controls</h2>
+        <form id="generate-form" hx-post="/api/generate" hx-swap="none">
+            <div class="form-group">
+                <label for="count">Number of QA Pairs:</label>
+                <input type="number" id="count" name="count" value="50" min="1" max="500">
+            </div>
+            <div class="form-group">
+                <label for="output_path">Output Path:</label>
+                <input type="text" id="output_path" name="output_path" value="output/dataset.jsonl">
+            </div>
+            <div class="button-group">
+                <button type="submit"
+                        class="btn btn-primary"
+                        {% if state.is_running %}disabled{% endif %}>
+                    Start Generation
+                </button>
+                <button type="button"
+                        class="btn btn-danger"
+                        hx-post="/api/stop"
+                        hx-swap="none"
+                        {% if not state.is_running %}disabled{% endif %}>
+                    Stop
+                </button>
+            </div>
+        </form>
+    </section>
+
+    <!-- Stats Grid -->
+    <section class="stats-grid">
+        <div class="stat-card">
+            <h3>Generated</h3>
+            <span class="stat-value" id="stat-generated">{{ state.stats.total_generated or 0 }}</span>
+        </div>
+        <div class="stat-card">
+            <h3>Valid</h3>
+            <span class="stat-value" id="stat-valid">{{ state.current_count }}</span>
+        </div>
+        <div class="stat-card">
+            <h3>Failed</h3>
+            <span class="stat-value" id="stat-failed">{{ state.stats.failed or 0 }}</span>
+        </div>
+        <div class="stat-card">
+            <h3>Pass Rate</h3>
+            <span class="stat-value" id="stat-rate">{{ state.stats.pass_rate or '0%' }}</span>
+        </div>
+    </section>
+
+    <!-- Two Column Layout -->
+    <div class="two-column">
+        <!-- Logs Section -->
+        <section class="logs-section">
+            <h2>Recent Logs</h2>
+            <div class="logs-container"
+                 hx-get="/partials/logs"
+                 hx-trigger="every 3s"
+                 hx-swap="innerHTML">
+                {% include "partials/logs.html" %}
+            </div>
+        </section>
+
+        <!-- Recent QA Section -->
+        <section class="qa-section">
+            <h2>Recent QA Pairs</h2>
+            <div class="qa-list-container"
+                 hx-get="/partials/qa-list"
+                 hx-trigger="every 5s"
+                 hx-swap="innerHTML">
+                {% include "partials/qa_list.html" %}
+            </div>
+        </section>
+    </div>
+</div>
+
+<script>
+    // Handle form submission feedback
+    document.body.addEventListener('htmx:afterRequest', function(evt) {
+        if (evt.detail.pathInfo.requestPath === '/api/generate') {
+            if (evt.detail.successful) {
+                // Refresh status immediately
+                htmx.trigger('#status-section', 'refresh');
+            } else {
+                alert('Failed to start generation: ' + evt.detail.xhr.responseText);
+            }
+        }
+    });
+</script>
+{% endblock %}
