@@ -49,23 +49,30 @@
                         <div class="field">
                             <label class="lbl">
                                 Format Validation Retries
-                                <span class="tooltip" data-tip="Max attempts to fix JSON schema errors. If generation output doesn't match expected format, retry up to this many times. Default: 3, 0 = unlimited.">?</span>
+                                <span class="tooltip" data-tip="Max attempts to fix JSON schema errors. If generation output doesn't match expected format, retry up to this many times. Default: 5, 0 = unlimited.">?</span>
                             </label>
-                            <input type="number" name="schema_retries" placeholder="3" min="0">
+                            <input type="number" name="schema_retries" placeholder="5" min="0">
+                        </div>
+                        <div class="field">
+                            <label class="lbl">
+                                Sanity Check Retries
+                                <span class="tooltip" data-tip="Max attempts to fix dimensional analysis, limiting cases, sign, and consistency errors. Catches ~80% of physics errors early. Default: 5, 0 = unlimited.">?</span>
+                            </label>
+                            <input type="number" name="sanity_retries" placeholder="5" min="0">
                         </div>
                         <div class="field">
                             <label class="lbl">
                                 Difficulty Check Retries
-                                <span class="tooltip" data-tip="Max attempts to regenerate if question is too easy. Uses Qwen model to verify graduate-level difficulty. Default: 5, 0 = unlimited.">?</span>
+                                <span class="tooltip" data-tip="Max attempts to regenerate if question is too easy. Uses Qwen model to verify graduate-level difficulty. Default: 20, 0 = unlimited.">?</span>
                             </label>
-                            <input type="number" name="qwen_retries" placeholder="5" min="0">
+                            <input type="number" name="qwen_retries" placeholder="20" min="0">
                         </div>
                         <div class="field">
                             <label class="lbl">
                                 Answer Verification Retries
-                                <span class="tooltip" data-tip="Max attempts to regenerate if crosscheck models disagree on the answer. Multiple models verify correctness. Default: 5, 0 = unlimited.">?</span>
+                                <span class="tooltip" data-tip="Max attempts to regenerate if crosscheck models disagree on the answer. Multiple models verify correctness. Default: 10, 0 = unlimited.">?</span>
                             </label>
-                            <input type="number" name="crosscheck_retries" placeholder="5" min="0">
+                            <input type="number" name="crosscheck_retries" placeholder="10" min="0">
                         </div>
                         <div class="field">
                             <label class="lbl">
@@ -82,14 +89,32 @@
                     <button type="button" class="btn btn-danger" id="btn-stop" hx-post="/api/stop" hx-swap="none" disabled>Stop</button>
                 </div>
             </form>
+
         </aside>
 
-        <section class="logs">
-            <div class="logs-header">
-                <span class="logs-title">System Logs</span>
+        <section class="main-panel">
+            <div class="tabs-header">
+                <button class="tab active" data-tab="logs">System Logs</button>
+                <button class="tab" data-tab="output">Output Files</button>
             </div>
-            <div class="logs-content" id="logs-content" hx-get="/partials/logs" hx-trigger="every 500ms" hx-swap="innerHTML">
-                {% include "partials/logs.html" %}
+            <div class="tabs-content">
+                <div class="tab-panel active" id="tab-logs">
+                    <div class="logs-content" id="logs-content" hx-get="/partials/logs" hx-trigger="every 500ms" hx-swap="innerHTML">
+                        {% include "partials/logs.html" %}
+                    </div>
+                </div>
+                <div class="tab-panel" id="tab-output">
+                    <div class="output-panel-layout">
+                        <div class="output-sidebar" hx-get="/partials/output-browser" hx-trigger="every 5s" hx-swap="innerHTML">
+                            {% include "partials/output_browser.html" %}
+                        </div>
+                        <div class="output-content" id="output-content">
+                            <div class="output-placeholder">
+                                Select a dataset to view its contents
+                            </div>
+                        </div>
+                    </div>
+                </div>
             </div>
         </section>
     </div>
@@ -98,6 +123,9 @@
 
 {% block scripts %}
 <script>
+// Track selected output file
+var selectedOutputFile = null;
+
 document.body.addEventListener('htmx:afterSwap', function(e) {
     if (e.detail.target.id === 'logs-content') {
         e.detail.target.scrollTop = e.detail.target.scrollHeight;
@@ -108,6 +136,80 @@ document.body.addEventListener('htmx:afterSwap', function(e) {
         document.getElementById('btn-run').disabled = !!running;
         document.getElementById('btn-stop').disabled = !running;
     }
+    // Process HTMX on newly swapped content (for output sidebar)
+    if (e.detail.target.classList.contains('output-sidebar')) {
+        htmx.process(e.detail.target);
+        // Restore selection after sidebar refresh
+        if (selectedOutputFile) {
+            var file = e.detail.target.querySelector('.output-file-name');
+            e.detail.target.querySelectorAll('.output-file').forEach(function(f) {
+                var name = f.querySelector('.output-file-name');
+                if (name && name.textContent === selectedOutputFile) {
+                    f.classList.add('selected');
+                }
+            });
+        }
+    }
+    // Re-render MathJax when output content is loaded
+    if (e.detail.target.id === 'output-content' && window.MathJax) {
+        MathJax.typeset();
+    }
+});
+
+// Handle output file selection
+document.body.addEventListener('click', function(e) {
+    var outputFile = e.target.closest('.output-file');
+    if (outputFile) {
+        var name = outputFile.querySelector('.output-file-name');
+        if (name) {
+            selectedOutputFile = name.textContent;
+        }
+        document.querySelectorAll('.output-file').forEach(function(f) { f.classList.remove('selected'); });
+        outputFile.classList.add('selected');
+    }
+});
+
+// Tooltip system - creates DOM elements to escape overflow clipping
+(function() {
+    var popup = null;
+
+    document.querySelectorAll('.tooltip').forEach(function(el) {
+        el.addEventListener('mouseenter', function() {
+            var tip = this.getAttribute('data-tip');
+            if (!tip) return;
+
+            popup = document.createElement('div');
+            popup.className = 'tooltip-popup';
+            popup.textContent = tip;
+            document.body.appendChild(popup);
+
+            var rect = this.getBoundingClientRect();
+            popup.style.left = (rect.right + 10) + 'px';
+            popup.style.top = (rect.top + rect.height / 2 - popup.offsetHeight / 2) + 'px';
+        });
+
+        el.addEventListener('mouseleave', function() {
+            if (popup) {
+                popup.remove();
+                popup = null;
+            }
+        });
+    });
+})();
+
+// Tab switching
+document.querySelectorAll('.tab').forEach(function(tab) {
+    tab.addEventListener('click', function() {
+        var targetId = 'tab-' + this.dataset.tab;
+
+        // Update tab buttons
+        document.querySelectorAll('.tab').forEach(function(t) { t.classList.remove('active'); });
+        this.classList.add('active');
+
+        // Update tab panels
+        document.querySelectorAll('.tab-panel').forEach(function(p) { p.classList.remove('active'); });
+        document.getElementById(targetId).classList.add('active');
+    });
 });
 </script>
 {% endblock %}

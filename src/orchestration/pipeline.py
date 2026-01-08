@@ -22,6 +22,9 @@ from ..validation.qwen_check import QwenConstraintValidator
 from ..validation.crosscheck import CrossCheckValidator
 from ..validation.final_answer import FinalAnswerValidator
 from ..validation.derivation_audit import DerivationAuditor
+from ..validation.sanity_check import SanityCheckValidator, MultiModelSanityValidator
+from ..validation.symbolic_math import SymbolicMathValidator
+from ..validation.completeness_check import CompletenessValidator, QuickCompletenessChecker
 
 logger = logging.getLogger(__name__)
 
@@ -525,6 +528,7 @@ class ParallelPipelineRunner:
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         topics: Optional[List[PhysicsTopic]] = None,
         schema_max_retries: Optional[int] = None,
+        sanity_check_max_retries: Optional[int] = None,
         qwen_max_retries: Optional[int] = None,
         crosscheck_max_retries: Optional[int] = None,
         final_validation_max_retries: Optional[int] = None,
@@ -541,6 +545,7 @@ class ParallelPipelineRunner:
             progress_callback: Optional callback for progress updates
             topics: Optional list of specific topics to generate questions for
             schema_max_retries: Max retries for schema validation. Default 3, 0 = unlimited.
+            sanity_check_max_retries: Max retries for sanity checks (dimensional analysis, etc.). Default 5, 0 = unlimited.
             qwen_max_retries: Max retries for Qwen difficulty check. Default 5, 0 = unlimited.
             crosscheck_max_retries: Max retries for cross-check validation. Default 5, 0 = unlimited.
             final_validation_max_retries: Max retries for final 5x blind validation. Default 10, 0 = unlimited.
@@ -565,6 +570,7 @@ class ParallelPipelineRunner:
 
         # Granular retry limits for each validation stage
         self.schema_max_retries = process_retry_limit(schema_max_retries, settings.schema_max_retries)
+        self.sanity_check_max_retries = process_retry_limit(sanity_check_max_retries, settings.sanity_check_max_retries)
         self.qwen_max_retries = process_retry_limit(qwen_max_retries, settings.qwen_max_retries)
         self.crosscheck_max_retries = process_retry_limit(crosscheck_max_retries, settings.crosscheck_max_retries)
         self.final_validation_max_retries = process_retry_limit(final_validation_max_retries, settings.final_validation_max_retries)
@@ -608,12 +614,20 @@ class ParallelPipelineRunner:
     def _report_progress(self, stage: str, details: Dict[str, Any]):
         """Report progress via callback."""
         if self.progress_callback:
-            self.progress_callback({
+            data = {
                 "stage": stage,
                 "stats": self.stats.to_summary_dict(),
                 "valid_count": len(self.valid_qa_pairs),
                 "details": details,
-            })
+                "phase": details.get("phase", 1),
+            }
+            # Include phase tracking info for both phase 2 and streaming mode
+            phase = details.get("phase")
+            if phase == 2 or phase == "streaming":
+                data["phase1_count"] = details.get("phase1_count", 0)
+                data["phase2_validated"] = details.get("phase2_validated", 0)
+                data["phase2_passed"] = details.get("phase2_passed", 0)
+            self.progress_callback(data)
 
     async def _worker(
         self,
@@ -679,11 +693,42 @@ class ParallelPipelineRunner:
 
             # Separate retry limits for each validation stage
             schema_max, schema_display = get_max_and_display(self.schema_max_retries)
+            sanity_max, sanity_display = get_max_and_display(self.sanity_check_max_retries)
             qwen_max, qwen_display = get_max_and_display(self.qwen_max_retries)
             crosscheck_max, crosscheck_display = get_max_and_display(self.crosscheck_max_retries)
 
+            # Create sanity check validator for this worker
+            # Use multi-model mode if configured (catches model blind spots)
+            if self.settings.use_multi_model_sanity:
+                sanity_validator = MultiModelSanityValidator(
+                    self.client,
+                    models=self.settings.sanity_check_models,
+                    consensus_mode=self.settings.sanity_consensus_mode,
+                )
+                logger.info(f"[Worker {worker_id}] Using multi-model sanity check with {len(self.settings.sanity_check_models)} models")
+            else:
+                sanity_validator = SanityCheckValidator(
+                    self.client,
+                    check_model=self.settings.judge_model,
+                )
+
+            # Create optional enhanced validators
+            symbolic_validator = None
+            if self.settings.use_symbolic_math:
+                symbolic_validator = SymbolicMathValidator()
+
+            completeness_validator = None
+            quick_completeness = None
+            if self.settings.use_completeness_check:
+                completeness_validator = CompletenessValidator(
+                    self.client,
+                    check_model=self.settings.judge_model,
+                )
+                quick_completeness = QuickCompletenessChecker()
+
             # Separate attempt counters
             schema_attempts = 0
+            sanity_attempts = 0
             qwen_attempts = 0
             crosscheck_attempts = 0
 
@@ -717,7 +762,89 @@ class ParallelPipelineRunner:
                         await results_queue.put(result)
                         return result
 
-                # === Stage 2: Qwen constraint check ===
+                # === Stage 1.5: Problem completeness check (optional) ===
+                # Ensures the problem is well-posed before checking the answer
+                if completeness_validator is not None:
+                    # Quick heuristic check first (no API call)
+                    if quick_completeness is not None:
+                        quick_complete, quick_warnings = quick_completeness.check(qa.query)
+                        if not quick_complete:
+                            logger.debug(f"[Worker {worker_id}] Quick completeness warnings: {quick_warnings}")
+
+                    # Full completeness check
+                    logger.info(f"[Worker {worker_id}] Running problem completeness check...")
+                    complete_passed, complete_details, complete_feedback = await completeness_validator.validate(qa)
+
+                    if not complete_passed:
+                        schema_attempts += 1  # Reuse schema counter for completeness
+                        logger.warning(f"[Worker {worker_id}] Problem is incomplete/ambiguous.")
+
+                        if schema_max != float('inf') and schema_attempts >= schema_max:
+                            result.error = f"Problem completeness failed after {schema_display} attempts"
+                            await results_queue.put(result)
+                            return result
+
+                        logger.info(f"[Worker {worker_id}] Regenerating to fix completeness issues")
+                        try:
+                            qa = await qa_generator.regenerate_with_feedback(
+                                original=qa,
+                                feedback=complete_feedback,
+                                temperature=0.7,
+                            )
+                            continue
+                        except Exception as e:
+                            logger.error(f"[Worker {worker_id}] Regeneration failed: {e}")
+                            result.error = str(e)
+                            await results_queue.put(result)
+                            return result
+
+                # === Stage 1.75: Symbolic math verification (optional, no API call) ===
+                # Programmatic check using SymPy - catches errors AI models miss
+                if symbolic_validator is not None:
+                    logger.debug(f"[Worker {worker_id}] Running symbolic math verification...")
+                    sym_passed, sym_details, sym_feedback = symbolic_validator.validate(
+                        qa.query, qa.response_answer, qa.response_reasoning
+                    )
+
+                    if not sym_passed:
+                        logger.warning(f"[Worker {worker_id}] Symbolic math check found issues: {sym_details}")
+                        # Don't fail outright - log as warning and let sanity check handle it
+                        # The feedback will be included if sanity check also fails
+
+                # === Stage 2: Sanity checks (dimensional analysis, limiting cases, etc.) ===
+                # This catches ~80% of errors with a single API call before expensive Qwen/cross-check
+                logger.info(f"[Worker {worker_id}] Running sanity checks (dimensional analysis, etc.)...")
+                sanity_passed, sanity_details, sanity_feedback = await sanity_validator.validate(qa)
+
+                if not sanity_passed:
+                    sanity_attempts += 1
+                    logger.warning(
+                        f"[Worker {worker_id}] Sanity check failed. "
+                        f"Regenerating (attempt {sanity_attempts}/{sanity_display})."
+                    )
+
+                    # Check if we've exceeded sanity check retry limit
+                    if sanity_max != float('inf') and sanity_attempts >= sanity_max:
+                        result.error = f"Sanity checks failed after {sanity_display} attempts"
+                        await results_queue.put(result)
+                        return result
+
+                    # Regenerate with detailed feedback about what failed
+                    logger.info(f"[Worker {worker_id}] Regenerating to fix sanity check failures (attempt {sanity_attempts + 1}/{sanity_display})")
+                    try:
+                        qa = await qa_generator.regenerate_with_feedback(
+                            original=qa,
+                            feedback=sanity_feedback,
+                            temperature=0.7,
+                        )
+                        continue  # Re-validate from the beginning (schema check)
+                    except Exception as e:
+                        logger.error(f"[Worker {worker_id}] Regeneration failed: {e}")
+                        result.error = str(e)
+                        await results_queue.put(result)
+                        return result
+
+                # === Stage 3: Qwen constraint check ===
                 logger.info(f"[Worker {worker_id}] Running Qwen constraint check...")
                 qwen_pass_rate, qwen_high_count, is_easy, _ = await qwen_validator.validate(
                     qa, samples=self.settings.samples_per_qwen_check
@@ -776,7 +903,7 @@ class ParallelPipelineRunner:
                         await results_queue.put(result)
                         return result
 
-                # === Stage 3: Cross-check validation ===
+                # === Stage 4: Cross-check validation ===
                 logger.info(f"[Worker {worker_id}] Running cross-check validation...")
                 _, models_correct, total_correct, crosscheck_valid, _ = (
                     await crosscheck_validator.validate(
@@ -848,324 +975,112 @@ class ParallelPipelineRunner:
         with open(self.output_path, "a") as f:
             f.write(qa.to_json_line() + "\n")
 
-    async def run(self, target_count: int) -> List[PhysicsQADataPoint]:
+    async def _run_phase2_validation(
+        self,
+        phase1_pairs: List[PhysicsQADataPoint],
+        target_count: int,
+    ) -> List[PhysicsQADataPoint]:
         """
-        Run the parallel pipeline to generate target_count QA pairs.
-
-        Spawns target_count workers initially. If some fail, spawns more
-        workers until we have enough valid QAs or hit max attempts.
+        Run Phase 2 validation (GPT-4 Audit + Answer Check) on a batch of QA pairs.
 
         Args:
-            target_count: Target number of valid QA pairs
+            phase1_pairs: QA pairs that passed Phase 1 (Qwen + Cross-check)
+            target_count: Original target count (for logging)
 
         Returns:
-            List of valid PhysicsQADataPoint objects
+            List of QA pairs that passed Phase 2 validation
         """
-        self.stats.started_at = datetime.utcnow()
+        if not phase1_pairs:
+            return []
+
         logger.info(
-            f"Starting parallel pipeline run {self.run_id}, "
-            f"target: {target_count} QA pairs"
+            f"\n{'='*60}\n"
+            f"PHASE 2: Final Validation (GPT-4 Audit + Answer Check)\n"
+            f"{'='*60}"
+        )
+        logger.info(
+            f"Validating {len(phase1_pairs)} QA pairs with:\n"
+            f"  - Derivation Audit: {self.settings.audit_model}\n"
+            f"  - Answer Validation: {self.settings.final_validation_model}"
         )
 
-        # Append to existing output file (don't delete - preserves data from failed runs)
-        # New QAs will be appended to the end
-        if self.output_path.exists():
-            logger.info(f"Appending to existing output file: {self.output_path}")
-        else:
-            logger.info(f"Creating new output file: {self.output_path}")
+        # Report phase transition
+        self._report_progress("phase2_started", {
+            "phase": 2,
+            "phase1_count": len(phase1_pairs),
+            "phase2_validated": 0,
+            "phase2_passed": len(getattr(self, 'fully_validated_pairs', [])),
+        })
 
-        results_queue: asyncio.Queue = asyncio.Queue()
-        all_results: List[WorkerResult] = []
-
-        # ALWAYS retry indefinitely until we reach the target count
-        # The pipeline should NEVER stop until it creates the amount of QA the user wants
-        max_total_workers = float('inf')  # No limit - keep trying until success
-        logger.info(
-            f"Pipeline will retry indefinitely until {target_count} valid QA pairs are generated. "
-            f"Data is written to disk immediately and will NOT be lost on failure."
+        # Create derivation auditor (uses GPT-4 for independent reasoning check)
+        derivation_auditor = DerivationAuditor(
+            client=self.client,
+            audit_model=self.settings.audit_model,
+            required_passes=5,  # 5 audit passes for reliability
         )
 
-        workers_spawned = 0
-        worker_id = 0
+        # Create final answer validator (uses GPT-4, not Claude)
+        final_validator = FinalAnswerValidator(
+            client=self.client,
+            judge_model=self.settings.final_validation_model,  # GPT-4, not Claude
+            required_consecutive_passes=self.settings.final_validation_passes,
+        )
 
-        # Initial batch of workers
-        initial_batch_size = target_count
-        pending_tasks: List[asyncio.Task] = []
+        # Create validators for full pipeline re-validation
+        qa_regenerator = QAGenerator(
+            client=self.client,
+            model=self.settings.generation_model,
+            judge_model=self.settings.judge_model,
+            solver_model=self.settings.solver_model,
+        )
+        qwen_validator = QwenConstraintValidator(
+            self.client,
+            qwen_model=self.settings.qwen_model,
+            judge_model=self.settings.judge_model,
+            max_pass_rate=self.settings.qwen_max_pass_rate,
+        )
+        crosscheck_validator = CrossCheckValidator(
+            self.client,
+            judge_model=self.settings.judge_model,
+            models=self.settings.crosscheck_models,
+            min_models_with_correct=self.settings.min_crosscheck_models,
+            min_total_correct=self.settings.min_crosscheck_total,
+        )
 
-        logger.info(f"Spawning initial batch of {initial_batch_size} workers...")
+        # Use configured final_validation_max_retries, or unlimited (float('inf')) if not set
+        MAX_REGEN_ATTEMPTS = self.final_validation_max_retries if self.final_validation_max_retries else float('inf')
+        max_display = "unlimited" if MAX_REGEN_ATTEMPTS == float('inf') else str(int(MAX_REGEN_ATTEMPTS))
 
-        for i in range(initial_batch_size):
-            task = asyncio.create_task(
-                self._worker(worker_id, target_count, results_queue)
-            )
-            pending_tasks.append(task)
-            worker_id += 1
-            workers_spawned += 1
+        pre_validation_count = len(phase1_pairs)
 
-        # Collect results and spawn more workers if needed
-        successful_count = 0
+        # Define async worker for validating a single QA pair
+        async def validate_single_qa(qa_idx: int, qa: PhysicsQADataPoint) -> Tuple[Optional[PhysicsQADataPoint], bool, int]:
+            """
+            Validate a single QA pair with regeneration loop.
 
-        while successful_count < target_count and not self._stop_requested:
-            # Wait for any result
-            try:
-                # Each worker can take up to 8 regeneration attempts × ~5 min each = ~40 min
-                # With Sonnet judge, this should be faster, but give buffer for larger batches
-                result = await asyncio.wait_for(results_queue.get(), timeout=3600)
-                all_results.append(result)
+            Validation order:
+            1. Derivation Audit (GPT-4) - checks reasoning quality
+            2. Final Answer Validation (GPT-4) - checks answer correctness
 
-                if result.success and result.qa:
-                    # Write immediately to output as soon as validation passes
-                    self.valid_qa_pairs.append(result.qa)
-                    self._write_to_output(result.qa)
-                    self.stats.total_generated += 1
-                    self.stats.passed_all += 1
-                    successful_count += 1
+            If either fails, regenerate and re-run full pipeline.
 
-                    logger.info(
-                        f"Progress: {successful_count}/{target_count} valid pairs "
-                        f"({workers_spawned} workers spawned) - Written to output"
-                    )
-                    self._report_progress("worker_completed", {
-                        "worker_id": result.worker_id,
-                        "success": True,
-                        "topic": result.topic,
-                        "valid_count": successful_count,
-                    })
-                else:
-                    self.stats.failed += 1
+            Returns (final_qa, passed, regen_attempts).
+            """
+            current_qa = qa
+            attempt = 0
+            regen_count = 0
+
+            while (MAX_REGEN_ATTEMPTS == float('inf') or attempt < MAX_REGEN_ATTEMPTS) and not self._stop_requested:
+                attempt += 1
+
+                # Step 1: Derivation Audit (GPT-4 checks reasoning quality)
+                logger.info(f"[Validator {qa_idx + 1}] Running derivation audit on {current_qa.id} (attempt {attempt}/{max_display})...")
+                audit_passed, audit_pass_count, audits = await derivation_auditor.audit(current_qa)
+
+                if not audit_passed:
                     logger.warning(
-                        f"Worker {result.worker_id} failed: {result.error or 'validation failed'}"
-                    )
-
-                    # Spawn a replacement worker if under limit
-                    if workers_spawned < max_total_workers and not self._stop_requested:
-                        task = asyncio.create_task(
-                            self._worker(worker_id, target_count, results_queue)
-                        )
-                        pending_tasks.append(task)
-                        worker_id += 1
-                        workers_spawned += 1
-                        logger.info(f"Spawned replacement worker {worker_id - 1}")
-
-            except asyncio.TimeoutError:
-                # Don't break - spawn more workers and continue trying
-                logger.warning(
-                    f"Timeout waiting for worker results. "
-                    f"Progress: {successful_count}/{target_count}. Spawning more workers..."
-                )
-                # Spawn a batch of replacement workers
-                for _ in range(min(5, target_count - successful_count)):
-                    if not self._stop_requested:
-                        task = asyncio.create_task(
-                            self._worker(worker_id, target_count, results_queue)
-                        )
-                        pending_tasks.append(task)
-                        worker_id += 1
-                        workers_spawned += 1
-                logger.info(f"Spawned {min(5, target_count - successful_count)} new workers after timeout")
-
-        # Cancel any remaining pending tasks
-        for task in pending_tasks:
-            if not task.done():
-                task.cancel()
-
-        # ===== POST-GENERATION: Final Validation with Derivation Audit =====
-        # Two-stage validation using GPT-4 (different model than Claude generator):
-        # 1. Derivation Audit: Check reasoning quality (logical consistency, no contradictions)
-        # 2. Final Answer Validation: Verify answer correctness (blind solve + compare)
-        #
-        # Using a DIFFERENT model (GPT-4) avoids circular reasoning where Claude
-        # validates its own flawed reasoning with the same blind spots.
-        if self.valid_qa_pairs and not self._stop_requested:
-            logger.info(
-                f"\n{'='*60}\n"
-                f"PHASE 2: Final Validation (GPT-4 Audit + Answer Check)\n"
-                f"{'='*60}"
-            )
-            logger.info(
-                f"Validating {len(self.valid_qa_pairs)} QA pairs with:\n"
-                f"  - Derivation Audit: {self.settings.audit_model}\n"
-                f"  - Answer Validation: {self.settings.final_validation_model}"
-            )
-
-            # Create derivation auditor (uses GPT-4 for independent reasoning check)
-            derivation_auditor = DerivationAuditor(
-                client=self.client,
-                audit_model=self.settings.audit_model,
-                required_passes=2,  # 2 audit passes for reliability
-            )
-
-            # Create final answer validator (uses GPT-4, not Claude)
-            final_validator = FinalAnswerValidator(
-                client=self.client,
-                judge_model=self.settings.final_validation_model,  # GPT-4, not Claude
-                required_consecutive_passes=self.settings.final_validation_passes,
-            )
-
-            # Create validators for full pipeline re-validation
-            qa_regenerator = QAGenerator(
-                client=self.client,
-                model=self.settings.generation_model,
-                judge_model=self.settings.judge_model,
-                solver_model=self.settings.solver_model,
-            )
-            qwen_validator = QwenConstraintValidator(
-                self.client,
-                qwen_model=self.settings.qwen_model,
-                judge_model=self.settings.judge_model,
-                max_pass_rate=self.settings.qwen_max_pass_rate,
-            )
-            crosscheck_validator = CrossCheckValidator(
-                self.client,
-                judge_model=self.settings.judge_model,
-                models=self.settings.crosscheck_models,
-                min_models_with_correct=self.settings.min_crosscheck_models,
-                min_total_correct=self.settings.min_crosscheck_total,
-            )
-
-            # Use configured final_validation_max_retries, or unlimited (float('inf')) if not set
-            MAX_REGEN_ATTEMPTS = self.final_validation_max_retries if self.final_validation_max_retries else float('inf')
-            max_display = "unlimited" if MAX_REGEN_ATTEMPTS == float('inf') else str(int(MAX_REGEN_ATTEMPTS))
-
-            pre_validation_count = len(self.valid_qa_pairs)
-
-            # Define async worker for validating a single QA pair
-            async def validate_single_qa(qa_idx: int, qa: PhysicsQADataPoint) -> Tuple[Optional[PhysicsQADataPoint], bool, int]:
-                """
-                Validate a single QA pair with regeneration loop.
-
-                Validation order:
-                1. Derivation Audit (GPT-4) - checks reasoning quality
-                2. Final Answer Validation (GPT-4) - checks answer correctness
-
-                If either fails, regenerate and re-run full pipeline.
-
-                Returns (final_qa, passed, regen_attempts).
-                """
-                current_qa = qa
-                attempt = 0
-                regen_count = 0
-
-                while (MAX_REGEN_ATTEMPTS == float('inf') or attempt < MAX_REGEN_ATTEMPTS) and not self._stop_requested:
-                    attempt += 1
-
-                    # Step 1: Derivation Audit (GPT-4 checks reasoning quality)
-                    logger.info(f"[Validator {qa_idx + 1}] Running derivation audit on {current_qa.id} (attempt {attempt}/{max_display})...")
-                    audit_passed, audit_pass_count, audits = await derivation_auditor.audit(current_qa)
-
-                    if not audit_passed:
-                        logger.warning(
-                            f"[Validator {qa_idx + 1}] QA {current_qa.id} FAILED derivation audit "
-                            f"({audit_pass_count}/2). Issues found in reasoning."
-                        )
-
-                        # Check retry limit
-                        if MAX_REGEN_ATTEMPTS != float('inf') and attempt >= MAX_REGEN_ATTEMPTS:
-                            logger.warning(f"[Validator {qa_idx + 1}] QA {qa.id} failed after {max_display} attempts")
-                            return None, False, regen_count
-
-                        # Extract feedback from audit and regenerate
-                        feedback = derivation_auditor.extract_feedback_from_audits(audits)
-                        logger.info(
-                            f"[Validator {qa_idx + 1}] Regenerating QA due to audit failure "
-                            f"(attempt {attempt + 1}/{max_display})..."
-                        )
-
-                        try:
-                            current_qa = await qa_regenerator.regenerate_with_feedback(
-                                original=current_qa,
-                                feedback=feedback,
-                                temperature=0.7,
-                            )
-                            regen_count += 1
-                            logger.info(f"[Validator {qa_idx + 1}] Regenerated QA, new ID: {current_qa.id}")
-                        except Exception as e:
-                            logger.error(f"[Validator {qa_idx + 1}] Regeneration failed: {e}")
-                            return None, False, regen_count
-
-                        # After regeneration, re-run Qwen and cross-check before retrying audit
-                        # Step 1b: Re-run Qwen check
-                        logger.info(f"[Validator {qa_idx + 1}] Re-running Qwen check on {current_qa.id}...")
-                        _, qwen_high_count, is_easy, _ = await qwen_validator.validate(
-                            current_qa, samples=self.settings.samples_per_qwen_check
-                        )
-
-                        if is_easy:
-                            logger.warning(
-                                f"[Validator {qa_idx + 1}] Regenerated QA {current_qa.id} is TOO EASY ({qwen_high_count}/5). "
-                                f"Regenerating with harder constraints."
-                            )
-                            feedback = (
-                                f"The corrected answer made the question TOO EASY. "
-                                f"Qwen solved it {qwen_high_count}/5 times. "
-                                "Make the question harder while keeping the answer correct."
-                            )
-                            try:
-                                current_qa = await qa_regenerator.regenerate_with_feedback(
-                                    original=current_qa,
-                                    feedback=feedback,
-                                    temperature=0.8,
-                                )
-                                regen_count += 1
-                            except Exception as e:
-                                logger.error(f"[Validator {qa_idx + 1}] Difficulty regeneration failed: {e}")
-                                return None, False, regen_count
-
-                        # Step 1c: Re-run Cross-check
-                        logger.info(f"[Validator {qa_idx + 1}] Re-running cross-check on {current_qa.id}...")
-                        _, models_correct, total_correct, crosscheck_valid, _ = (
-                            await crosscheck_validator.validate(
-                                current_qa, samples_per_model=self.settings.samples_per_crosscheck
-                            )
-                        )
-
-                        if not crosscheck_valid:
-                            logger.warning(
-                                f"[Validator {qa_idx + 1}] QA {current_qa.id} failed cross-check "
-                                f"({total_correct}/20). Regenerating with answer feedback."
-                            )
-                            # FIX: Provide feedback and regenerate instead of just continuing
-                            feedback = (
-                                f"CRITICAL: The answer appears to be INCORRECT. "
-                                f"Only {total_correct}/20 attempts across 4 frontier models matched your answer "
-                                f"(need at least 5). Models with any correct: {models_correct}/4.\n\n"
-                                "You MUST:\n"
-                                "1. Re-derive the answer from FIRST PRINCIPLES\n"
-                                "2. Check your algebra step-by-step for sign errors, missing factors\n"
-                                "3. Verify dimensional analysis\n"
-                                "4. Check limiting cases\n"
-                                "5. If the problem is ambiguous, clarify it"
-                            )
-                            try:
-                                current_qa = await qa_regenerator.regenerate_with_feedback(
-                                    original=current_qa,
-                                    feedback=feedback,
-                                    temperature=0.7,
-                                )
-                                regen_count += 1
-                                logger.info(f"[Validator {qa_idx + 1}] Regenerated QA after cross-check failure, new ID: {current_qa.id}")
-                            except Exception as e:
-                                logger.error(f"[Validator {qa_idx + 1}] Cross-check regeneration failed: {e}")
-                                return None, False, regen_count
-
-                        continue  # Re-run from the beginning (audit)
-
-                    # Step 2: Final Answer Validation (GPT-4 blind solve + compare)
-                    logger.info(f"[Validator {qa_idx + 1}] Running final answer validation on {current_qa.id}...")
-                    passed, pass_count, judgments = await final_validator.validate(current_qa)
-
-                    if passed:
-                        logger.info(
-                            f"[Validator {qa_idx + 1}] QA {current_qa.id} PASSED all validation "
-                            f"(audit: 2/2, answer: {pass_count}/{self.settings.final_validation_passes}) "
-                            f"on attempt {attempt}"
-                        )
-                        return current_qa, True, regen_count
-
-                    # Final validation failed
-                    logger.warning(
-                        f"[Validator {qa_idx + 1}] QA {current_qa.id} failed answer validation "
-                        f"({pass_count}/{self.settings.final_validation_passes})"
+                        f"[Validator {qa_idx + 1}] QA {current_qa.id} FAILED derivation audit "
+                        f"({audit_pass_count}/5). Issues found in reasoning."
                     )
 
                     # Check retry limit
@@ -1173,10 +1088,10 @@ class ParallelPipelineRunner:
                         logger.warning(f"[Validator {qa_idx + 1}] QA {qa.id} failed after {max_display} attempts")
                         return None, False, regen_count
 
-                    # Extract feedback and regenerate
-                    feedback = final_validator._extract_feedback_from_judgments(judgments)
+                    # Extract feedback from audit and regenerate
+                    feedback = derivation_auditor.extract_feedback_from_audits(audits)
                     logger.info(
-                        f"[Validator {qa_idx + 1}] Regenerating QA due to answer validation failure "
+                        f"[Validator {qa_idx + 1}] Regenerating QA due to audit failure "
                         f"(attempt {attempt + 1}/{max_display})..."
                     )
 
@@ -1192,8 +1107,8 @@ class ParallelPipelineRunner:
                         logger.error(f"[Validator {qa_idx + 1}] Regeneration failed: {e}")
                         return None, False, regen_count
 
-                    # Re-run Qwen and cross-check on regenerated QA
-                    # Step 2b: Re-run Qwen check
+                    # After regeneration, re-run Qwen and cross-check before retrying audit
+                    # Step 1b: Re-run Qwen check
                     logger.info(f"[Validator {qa_idx + 1}] Re-running Qwen check on {current_qa.id}...")
                     _, qwen_high_count, is_easy, _ = await qwen_validator.validate(
                         current_qa, samples=self.settings.samples_per_qwen_check
@@ -1220,7 +1135,7 @@ class ParallelPipelineRunner:
                             logger.error(f"[Validator {qa_idx + 1}] Difficulty regeneration failed: {e}")
                             return None, False, regen_count
 
-                    # Step 2c: Re-run Cross-check
+                    # Step 1c: Re-run Cross-check
                     logger.info(f"[Validator {qa_idx + 1}] Re-running cross-check on {current_qa.id}...")
                     _, models_correct, total_correct, crosscheck_valid, _ = (
                         await crosscheck_validator.validate(
@@ -1233,7 +1148,6 @@ class ParallelPipelineRunner:
                             f"[Validator {qa_idx + 1}] QA {current_qa.id} failed cross-check "
                             f"({total_correct}/20). Regenerating with answer feedback."
                         )
-                        # FIX: Provide feedback and regenerate instead of just continuing
                         feedback = (
                             f"CRITICAL: The answer appears to be INCORRECT. "
                             f"Only {total_correct}/20 attempts across 4 frontier models matched your answer "
@@ -1257,91 +1171,664 @@ class ParallelPipelineRunner:
                             logger.error(f"[Validator {qa_idx + 1}] Cross-check regeneration failed: {e}")
                             return None, False, regen_count
 
-                    # Loop back to re-run full validation (audit + answer check)
+                    continue  # Re-run from the beginning (audit)
 
-                return None, False, regen_count
+                # Step 2: Final Answer Validation (GPT-4 blind solve + compare)
+                logger.info(f"[Validator {qa_idx + 1}] Running final answer validation on {current_qa.id}...")
+                passed, pass_count, judgments = await final_validator.validate(current_qa)
 
-            # Run all validations in parallel
-            logger.info(f"Starting parallel final validation for {pre_validation_count} QA pairs...")
-            validation_tasks = [
-                validate_single_qa(i, qa)
-                for i, qa in enumerate(self.valid_qa_pairs)
-            ]
+                if passed:
+                    logger.info(
+                        f"[Validator {qa_idx + 1}] QA {current_qa.id} PASSED all validation "
+                        f"(audit: {audit_pass_count}/5, answer: {pass_count}/{self.settings.final_validation_passes}) "
+                        f"on attempt {attempt}"
+                    )
+                    return current_qa, True, regen_count
 
-            # Gather all results
-            validation_results = await asyncio.gather(*validation_tasks, return_exceptions=True)
+                # Final validation failed
+                logger.warning(
+                    f"[Validator {qa_idx + 1}] QA {current_qa.id} failed answer validation "
+                    f"({pass_count}/{self.settings.final_validation_passes})"
+                )
 
-            # Process results
-            passed_pairs = []
-            failed_pairs = []
-            total_regen_attempts = 0
+                # Check retry limit
+                if MAX_REGEN_ATTEMPTS != float('inf') and attempt >= MAX_REGEN_ATTEMPTS:
+                    logger.warning(f"[Validator {qa_idx + 1}] QA {qa.id} failed after {max_display} attempts")
+                    return None, False, regen_count
 
-            for i, result in enumerate(validation_results):
-                original_qa = self.valid_qa_pairs[i]
+                # Extract feedback and regenerate
+                feedback = final_validator._extract_feedback_from_judgments(judgments)
+                logger.info(
+                    f"[Validator {qa_idx + 1}] Regenerating QA due to answer validation failure "
+                    f"(attempt {attempt + 1}/{max_display})..."
+                )
 
-                if isinstance(result, Exception):
-                    logger.error(f"Validation task {i + 1} failed with exception: {result}")
-                    failed_pairs.append(original_qa)
-                    continue
+                try:
+                    current_qa = await qa_regenerator.regenerate_with_feedback(
+                        original=current_qa,
+                        feedback=feedback,
+                        temperature=0.7,
+                    )
+                    regen_count += 1
+                    logger.info(f"[Validator {qa_idx + 1}] Regenerated QA, new ID: {current_qa.id}")
+                except Exception as e:
+                    logger.error(f"[Validator {qa_idx + 1}] Regeneration failed: {e}")
+                    return None, False, regen_count
 
-                final_qa, passed, regen_count = result
-                total_regen_attempts += regen_count
+                # Re-run Qwen and cross-check on regenerated QA
+                # Step 2b: Re-run Qwen check
+                logger.info(f"[Validator {qa_idx + 1}] Re-running Qwen check on {current_qa.id}...")
+                _, qwen_high_count, is_easy, _ = await qwen_validator.validate(
+                    current_qa, samples=self.settings.samples_per_qwen_check
+                )
 
-                if passed and final_qa:
-                    passed_pairs.append(final_qa)
-                else:
-                    failed_pairs.append(original_qa)
+                if is_easy:
+                    logger.warning(
+                        f"[Validator {qa_idx + 1}] Regenerated QA {current_qa.id} is TOO EASY ({qwen_high_count}/5). "
+                        f"Regenerating with harder constraints."
+                    )
+                    feedback = (
+                        f"The corrected answer made the question TOO EASY. "
+                        f"Qwen solved it {qwen_high_count}/5 times. "
+                        "Make the question harder while keeping the answer correct."
+                    )
+                    try:
+                        current_qa = await qa_regenerator.regenerate_with_feedback(
+                            original=current_qa,
+                            feedback=feedback,
+                            temperature=0.8,
+                        )
+                        regen_count += 1
+                    except Exception as e:
+                        logger.error(f"[Validator {qa_idx + 1}] Difficulty regeneration failed: {e}")
+                        return None, False, regen_count
 
-            # Store validation results for stats
+                # Step 2c: Re-run Cross-check
+                logger.info(f"[Validator {qa_idx + 1}] Re-running cross-check on {current_qa.id}...")
+                _, models_correct, total_correct, crosscheck_valid, _ = (
+                    await crosscheck_validator.validate(
+                        current_qa, samples_per_model=self.settings.samples_per_crosscheck
+                    )
+                )
+
+                if not crosscheck_valid:
+                    logger.warning(
+                        f"[Validator {qa_idx + 1}] QA {current_qa.id} failed cross-check "
+                        f"({total_correct}/20). Regenerating with answer feedback."
+                    )
+                    feedback = (
+                        f"CRITICAL: The answer appears to be INCORRECT. "
+                        f"Only {total_correct}/20 attempts across 4 frontier models matched your answer "
+                        f"(need at least 5). Models with any correct: {models_correct}/4.\n\n"
+                        "You MUST:\n"
+                        "1. Re-derive the answer from FIRST PRINCIPLES\n"
+                        "2. Check your algebra step-by-step for sign errors, missing factors\n"
+                        "3. Verify dimensional analysis\n"
+                        "4. Check limiting cases\n"
+                        "5. If the problem is ambiguous, clarify it"
+                    )
+                    try:
+                        current_qa = await qa_regenerator.regenerate_with_feedback(
+                            original=current_qa,
+                            feedback=feedback,
+                            temperature=0.7,
+                        )
+                        regen_count += 1
+                        logger.info(f"[Validator {qa_idx + 1}] Regenerated QA after cross-check failure, new ID: {current_qa.id}")
+                    except Exception as e:
+                        logger.error(f"[Validator {qa_idx + 1}] Cross-check regeneration failed: {e}")
+                        return None, False, regen_count
+
+                # Loop back to re-run full validation (audit + answer check)
+
+            return None, False, regen_count
+
+        # Run all validations in parallel with progress tracking
+        logger.info(f"Starting parallel final validation for {pre_validation_count} QA pairs...")
+
+        # Shared counter for tracking progress
+        validated_count = 0
+        passed_count = 0
+        validated_lock = asyncio.Lock()
+
+        async def validate_with_progress(qa_idx: int, qa: PhysicsQADataPoint):
+            """Wrapper that reports progress after each validation."""
+            nonlocal validated_count, passed_count
+            result = await validate_single_qa(qa_idx, qa)
+
+            async with validated_lock:
+                validated_count += 1
+                if result[1]:  # passed
+                    passed_count += 1
+
+                # Report progress
+                self._report_progress("phase2_progress", {
+                    "phase": 2,
+                    "phase1_count": pre_validation_count,
+                    "phase2_validated": validated_count,
+                    "phase2_passed": len(getattr(self, 'fully_validated_pairs', [])) + passed_count,
+                })
+
+            return result
+
+        validation_tasks = [
+            validate_with_progress(i, qa)
+            for i, qa in enumerate(phase1_pairs)
+        ]
+
+        # Gather all results
+        validation_results = await asyncio.gather(*validation_tasks, return_exceptions=True)
+
+        # Process results
+        passed_pairs = []
+        failed_pairs = []
+        total_regen_attempts = 0
+
+        for i, result in enumerate(validation_results):
+            original_qa = phase1_pairs[i]
+
+            if isinstance(result, Exception):
+                logger.error(f"Validation task {i + 1} failed with exception: {result}")
+                failed_pairs.append(original_qa)
+                continue
+
+            final_qa, passed, regen_count = result
+            total_regen_attempts += regen_count
+
+            if passed and final_qa:
+                passed_pairs.append(final_qa)
+            else:
+                failed_pairs.append(original_qa)
+
+        # Store validation results for stats (accumulate across rounds)
+        if not hasattr(self, 'final_validation_summary'):
             self.final_validation_summary = {
-                "total_validated": pre_validation_count,
-                "passed": len(passed_pairs),
-                "failed": len(failed_pairs),
-                "pass_rate": f"{len(passed_pairs) / pre_validation_count:.1%}" if pre_validation_count > 0 else "0%",
+                "total_validated": 0,
+                "passed": 0,
+                "failed": 0,
                 "audit_model": self.settings.audit_model,
                 "final_validation_model": self.settings.final_validation_model,
                 "required_audit_passes": 2,
                 "required_answer_passes": self.settings.final_validation_passes,
-                "total_regeneration_attempts": total_regen_attempts,
+                "total_regeneration_attempts": 0,
             }
 
-            # Update the valid pairs to only include those that passed
-            self.valid_qa_pairs = passed_pairs
+        self.final_validation_summary["total_validated"] += pre_validation_count
+        self.final_validation_summary["passed"] += len(passed_pairs)
+        self.final_validation_summary["failed"] += len(failed_pairs)
+        self.final_validation_summary["total_regeneration_attempts"] += total_regen_attempts
+        total_validated = self.final_validation_summary["total_validated"]
+        total_passed = self.final_validation_summary["passed"]
+        self.final_validation_summary["pass_rate"] = f"{total_passed / total_validated:.1%}" if total_validated > 0 else "0%"
 
-            # Write validated pairs to the final output file
-            if passed_pairs:
-                final_output_path = self.output_path.with_suffix('.final.jsonl')
-                with open(final_output_path, "w") as f:
-                    for qa in passed_pairs:
-                        f.write(qa.to_json_line() + "\n")
-                logger.info(f"Wrote {len(passed_pairs)} final validated QA pairs to: {final_output_path}")
-                logger.info(f"Original cross-check validated pairs preserved in: {self.output_path}")
+        logger.info(
+            f"\nPhase 2 Batch Results:\n"
+            f"  - Validated: {pre_validation_count} QA pairs\n"
+            f"  - Passed: {len(passed_pairs)} QA pairs\n"
+            f"  - Failed: {len(failed_pairs)} QA pairs\n"
+            f"  - Regeneration attempts: {total_regen_attempts}"
+        )
 
-            # Write failed pairs to a separate file for debugging
-            if failed_pairs:
-                failed_output_path = self.output_path.with_suffix('.failed.jsonl')
-                with open(failed_output_path, "w") as f:
-                    for qa in failed_pairs:
-                        f.write(qa.to_json_line() + "\n")
-                logger.info(f"Wrote {len(failed_pairs)} failed pairs to: {failed_output_path}")
+        if failed_pairs:
+            logger.warning(
+                f"The following {len(failed_pairs)} QA pairs failed final validation:"
+            )
+            for qa in failed_pairs:
+                logger.warning(f"  - {qa.id}: {qa.subtopic}")
 
-            logger.info(
-                f"\nFinal Validation Results (GPT-4 Audit + Answer Check):\n"
-                f"  - Pre-validation: {pre_validation_count} QA pairs\n"
-                f"  - Passed (audit 2/2 + answer {self.settings.final_validation_passes}/{self.settings.final_validation_passes}): {len(passed_pairs)} QA pairs\n"
-                f"  - Failed: {len(failed_pairs)} QA pairs\n"
-                f"  - Total regeneration attempts: {total_regen_attempts}\n"
-                f"  - Pass rate: {self.final_validation_summary['pass_rate']}\n"
-                f"  - Audit model: {self.settings.audit_model}\n"
-                f"  - Validation model: {self.settings.final_validation_model}"
+        return passed_pairs
+
+    async def _regenerate_and_revalidate(
+        self,
+        qa: PhysicsQADataPoint,
+        feedback: str,
+        qa_regenerator: QAGenerator,
+        qwen_validator: QwenConstraintValidator,
+        crosscheck_validator: CrossCheckValidator,
+        worker_id: int,
+    ) -> PhysicsQADataPoint:
+        """
+        Regenerate a QA pair and re-run Qwen + cross-check validation.
+
+        This ensures the regenerated QA still passes the difficulty and correctness
+        checks before going back to Phase 2 audit.
+
+        Args:
+            qa: Original QA to regenerate
+            feedback: Feedback about what failed
+            qa_regenerator: Generator for regeneration
+            qwen_validator: Qwen constraint validator
+            crosscheck_validator: Cross-check validator
+            worker_id: For logging
+
+        Returns:
+            Regenerated and validated QA
+
+        Raises:
+            Exception if regeneration or validation fails repeatedly
+        """
+        MAX_REGEN_LOOPS = 5  # Max attempts to get a valid regeneration
+
+        current_qa = qa
+        for loop in range(MAX_REGEN_LOOPS):
+            # Regenerate with feedback
+            logger.info(f"[Audit {worker_id}] Regenerating QA (loop {loop + 1}/{MAX_REGEN_LOOPS})...")
+            current_qa = await qa_regenerator.regenerate_with_feedback(
+                original=current_qa, feedback=feedback, temperature=0.7
             )
 
-            if failed_pairs:
-                logger.warning(
-                    f"The following {len(failed_pairs)} QA pairs failed final validation and were removed:"
+            # Re-run Qwen constraint check
+            logger.info(f"[Audit {worker_id}] Re-running Qwen check on regenerated QA...")
+            _, qwen_high_count, is_easy, _ = await qwen_validator.validate(
+                current_qa, samples=self.settings.samples_per_qwen_check
+            )
+
+            if is_easy:
+                logger.warning(f"[Audit {worker_id}] Regenerated QA too easy ({qwen_high_count}/5). Making harder...")
+                feedback = f"Question TOO EASY ({qwen_high_count}/5). Make MUCH harder - require multi-step derivation."
+                continue  # Try again with harder question
+
+            # Re-run cross-check validation
+            logger.info(f"[Audit {worker_id}] Re-running cross-check on regenerated QA...")
+            _, models_correct, total_correct, crosscheck_valid, _ = await crosscheck_validator.validate(
+                current_qa, samples_per_model=self.settings.samples_per_crosscheck
+            )
+
+            if not crosscheck_valid:
+                logger.warning(f"[Audit {worker_id}] Regenerated QA failed cross-check ({total_correct}/20). Re-deriving...")
+                feedback = f"Answer INCORRECT ({total_correct}/20, {models_correct}/4 models). Re-derive from first principles with careful dimensional analysis."
+                continue  # Try again with correct answer
+
+            # Both checks passed!
+            logger.info(f"[Audit {worker_id}] Regenerated QA passed Qwen and cross-check validation")
+            return current_qa
+
+        raise Exception(f"Failed to regenerate valid QA after {MAX_REGEN_LOOPS} attempts")
+
+    async def _audit_worker(
+        self,
+        audit_queue: asyncio.Queue,
+        validated_queue: asyncio.Queue,
+        worker_id: int,
+    ):
+        """
+        Audit worker that processes Phase 1 QAs as they arrive.
+
+        Runs Phase 2 validation (derivation audit + final answer check) on each QA.
+        Puts validated QAs into the validated_queue.
+
+        Args:
+            audit_queue: Queue of Phase 1 QAs to validate
+            validated_queue: Queue to put validated QAs into
+            worker_id: ID for logging
+        """
+        # Create validators for this audit worker
+        derivation_auditor = DerivationAuditor(
+            client=self.client,
+            audit_model=self.settings.audit_model,
+            required_passes=5,
+        )
+        final_validator = FinalAnswerValidator(
+            client=self.client,
+            judge_model=self.settings.final_validation_model,
+            required_consecutive_passes=self.settings.final_validation_passes,
+        )
+        qa_regenerator = QAGenerator(
+            client=self.client,
+            model=self.settings.generation_model,
+            judge_model=self.settings.judge_model,
+            solver_model=self.settings.solver_model,
+        )
+        qwen_validator = QwenConstraintValidator(
+            self.client,
+            qwen_model=self.settings.qwen_model,
+            judge_model=self.settings.judge_model,
+            max_pass_rate=self.settings.qwen_max_pass_rate,
+        )
+        crosscheck_validator = CrossCheckValidator(
+            self.client,
+            judge_model=self.settings.judge_model,
+            models=self.settings.crosscheck_models,
+            min_models_with_correct=self.settings.min_crosscheck_models,
+            min_total_correct=self.settings.min_crosscheck_total,
+        )
+
+        MAX_REGEN_ATTEMPTS = self.final_validation_max_retries if self.final_validation_max_retries else float('inf')
+        max_display = "unlimited" if MAX_REGEN_ATTEMPTS == float('inf') else str(int(MAX_REGEN_ATTEMPTS))
+
+        while True:
+            try:
+                # Get next QA to audit (with timeout to check for stop)
+                try:
+                    item = await asyncio.wait_for(audit_queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    if self._stop_requested:
+                        break
+                    continue
+
+                if item is None:  # Shutdown signal
+                    break
+
+                qa = item
+                current_qa = qa
+                attempt = 0
+                regen_count = 0
+                passed = False
+
+                while (MAX_REGEN_ATTEMPTS == float('inf') or attempt < MAX_REGEN_ATTEMPTS) and not self._stop_requested:
+                    attempt += 1
+
+                    # Step 1: Derivation Audit
+                    logger.info(f"[Audit {worker_id}] Running derivation audit on {current_qa.id} (attempt {attempt}/{max_display})...")
+                    audit_passed, audit_pass_count, audits = await derivation_auditor.audit(current_qa)
+
+                    if not audit_passed:
+                        logger.warning(f"[Audit {worker_id}] QA {current_qa.id} FAILED derivation audit ({audit_pass_count}/5)")
+
+                        if MAX_REGEN_ATTEMPTS != float('inf') and attempt >= MAX_REGEN_ATTEMPTS:
+                            break
+
+                        feedback = derivation_auditor.extract_feedback_from_audits(audits)
+                        try:
+                            current_qa = await self._regenerate_and_revalidate(
+                                current_qa, feedback, qa_regenerator, qwen_validator, crosscheck_validator, worker_id
+                            )
+                            regen_count += 1
+                            continue  # Go back to derivation audit with regenerated QA
+                        except Exception as e:
+                            logger.error(f"[Audit {worker_id}] Regeneration failed: {e}")
+                            break
+
+                    # Step 2: Final Answer Validation
+                    logger.info(f"[Audit {worker_id}] Running final answer validation on {current_qa.id}...")
+                    val_passed, pass_count, judgments = await final_validator.validate(current_qa)
+
+                    if val_passed:
+                        logger.info(f"[Audit {worker_id}] QA {current_qa.id} PASSED all validation!")
+                        passed = True
+                        break
+
+                    logger.warning(f"[Audit {worker_id}] QA {current_qa.id} failed answer validation ({pass_count}/{self.settings.final_validation_passes})")
+
+                    if MAX_REGEN_ATTEMPTS != float('inf') and attempt >= MAX_REGEN_ATTEMPTS:
+                        break
+
+                    feedback = final_validator._extract_feedback_from_judgments(judgments)
+                    try:
+                        current_qa = await self._regenerate_and_revalidate(
+                            current_qa, feedback, qa_regenerator, qwen_validator, crosscheck_validator, worker_id
+                        )
+                        regen_count += 1
+                        # Loop back to derivation audit (will re-check everything)
+                    except Exception as e:
+                        logger.error(f"[Audit {worker_id}] Regeneration failed: {e}")
+                        break
+
+                # Put result into validated queue
+                await validated_queue.put((current_qa if passed else None, passed, regen_count))
+                audit_queue.task_done()
+
+            except Exception as e:
+                logger.error(f"[Audit {worker_id}] Unexpected error: {e}")
+                audit_queue.task_done()
+
+    async def run(self, target_count: int) -> List[PhysicsQADataPoint]:
+        """
+        Run the parallel pipeline to generate target_count QA pairs.
+
+        Phase 1 (generation) and Phase 2 (audit) run concurrently:
+        - Generation workers produce QA pairs that pass initial validation
+        - Audit workers immediately start validating Phase 1 QAs as they complete
+        - This streaming approach reduces total pipeline time significantly
+
+        Args:
+            target_count: Target number of valid QA pairs
+
+        Returns:
+            List of valid PhysicsQADataPoint objects
+        """
+        self.stats.started_at = datetime.utcnow()
+        logger.info(
+            f"Starting parallel pipeline run {self.run_id}, "
+            f"target: {target_count} QA pairs (streaming Phase 1 + Phase 2)"
+        )
+
+        # Append to existing output file (don't delete - preserves data from failed runs)
+        if self.output_path.exists():
+            logger.info(f"Appending to existing output file: {self.output_path}")
+        else:
+            logger.info(f"Creating new output file: {self.output_path}")
+
+        # Track fully validated QAs (passed both Phase 1 and Phase 2)
+        self.fully_validated_pairs: List[PhysicsQADataPoint] = []
+        backfill_round = 0
+
+        # Outer loop: keep going until we have target_count fully validated QAs
+        while len(self.fully_validated_pairs) < target_count and not self._stop_requested:
+            backfill_round += 1
+            needed_count = target_count - len(self.fully_validated_pairs)
+
+            if backfill_round == 1:
+                logger.info(
+                    f"Pipeline will retry indefinitely until {target_count} valid QA pairs are generated. "
+                    f"Phase 1 (generation) and Phase 2 (audit) run concurrently for faster throughput."
                 )
-                for qa in failed_pairs:
-                    logger.warning(f"  - {qa.id}: {qa.subtopic}")
+            else:
+                logger.info(
+                    f"\n{'='*60}\n"
+                    f"BACKFILL ROUND {backfill_round}: Need {needed_count} more QA pairs\n"
+                    f"{'='*60}"
+                )
+
+            # Queues for streaming pipeline
+            phase1_results_queue: asyncio.Queue = asyncio.Queue()
+            audit_queue: asyncio.Queue = asyncio.Queue()  # Phase 1 QAs waiting for audit
+            validated_queue: asyncio.Queue = asyncio.Queue()  # Audit results
+
+            phase1_results: List[WorkerResult] = []
+            workers_spawned = 0
+            worker_id = backfill_round * 10000
+
+            # Spawn Phase 1 generation workers
+            pending_gen_tasks: List[asyncio.Task] = []
+            logger.info(f"Spawning {needed_count} generation workers for Phase 1...")
+
+            for i in range(needed_count):
+                task = asyncio.create_task(
+                    self._worker(worker_id, needed_count, phase1_results_queue)
+                )
+                pending_gen_tasks.append(task)
+                worker_id += 1
+                workers_spawned += 1
+
+            # Spawn audit workers (run concurrently with generation)
+            # Use fewer audit workers since audits are heavier
+            num_audit_workers = max(2, min(needed_count // 2, 10))
+            audit_tasks: List[asyncio.Task] = []
+            logger.info(f"Spawning {num_audit_workers} audit workers for Phase 2 (streaming)...")
+
+            for i in range(num_audit_workers):
+                task = asyncio.create_task(
+                    self._audit_worker(audit_queue, validated_queue, i)
+                )
+                audit_tasks.append(task)
+
+            # Track progress
+            phase1_successful_count = 0
+            phase1_pairs: List[PhysicsQADataPoint] = []
+            audit_submitted_count = 0
+            audit_completed_count = 0
+            audit_passed_count = 0
+            total_regen_attempts = 0
+            round_validated: List[PhysicsQADataPoint] = []  # Collect validated QAs here
+
+            # Report phase start - start as Phase 1 until we have QAs to audit
+            self._report_progress("phase1_started", {
+                "phase": 1,
+                "valid_count": 0,  # For Phase 1 progress bar
+                "phase1_count": 0,
+                "phase2_validated": 0,
+                "phase2_passed": len(self.fully_validated_pairs),
+            })
+
+            # Main collection loop - handles both Phase 1 results and audit results
+            while (phase1_successful_count < needed_count or audit_completed_count < audit_submitted_count) and not self._stop_requested:
+                # Check for Phase 1 results (non-blocking if we have enough)
+                if phase1_successful_count < needed_count:
+                    try:
+                        result = await asyncio.wait_for(phase1_results_queue.get(), timeout=0.1)
+                        phase1_results.append(result)
+                        self.all_results.append(result)
+
+                        if result.success and result.qa:
+                            phase1_pairs.append(result.qa)
+                            self.valid_qa_pairs.append(result.qa)
+                            self._write_to_output(result.qa)
+                            self.stats.total_generated += 1
+                            self.stats.passed_all += 1
+                            phase1_successful_count += 1
+
+                            # Immediately submit to audit queue (streaming!)
+                            await audit_queue.put(result.qa)
+                            audit_submitted_count += 1
+
+                            logger.info(
+                                f"Phase 1: {phase1_successful_count}/{needed_count} | "
+                                f"Phase 2: {audit_passed_count}/{audit_submitted_count} auditing "
+                                f"(round {backfill_round})"
+                            )
+                            # Only switch to "streaming" phase once audits start
+                            # Until then, show as Phase 1
+                            current_phase = "streaming" if audit_submitted_count > 0 else 1
+                            self._report_progress("streaming_progress", {
+                                "phase": current_phase,
+                                "valid_count": phase1_successful_count,  # For Phase 1 progress bar
+                                "phase1_count": phase1_successful_count,
+                                "phase2_validated": audit_completed_count,
+                                "phase2_passed": len(self.fully_validated_pairs) + audit_passed_count,
+                            })
+                        else:
+                            self.stats.failed += 1
+                            logger.warning(f"Worker {result.worker_id} failed: {result.error or 'validation failed'}")
+
+                            # Spawn replacement worker
+                            if not self._stop_requested:
+                                task = asyncio.create_task(
+                                    self._worker(worker_id, needed_count, phase1_results_queue)
+                                )
+                                pending_gen_tasks.append(task)
+                                worker_id += 1
+                                workers_spawned += 1
+
+                    except asyncio.TimeoutError:
+                        pass  # No Phase 1 result ready, check audit results
+
+                # Check for audit results (non-blocking)
+                try:
+                    validated_qa, passed, regen_count = await asyncio.wait_for(validated_queue.get(), timeout=0.1)
+                    audit_completed_count += 1
+                    total_regen_attempts += regen_count
+
+                    if passed and validated_qa:
+                        audit_passed_count += 1
+                        round_validated.append(validated_qa)  # Collect the validated QA!
+                        logger.info(
+                            f"Phase 1: {phase1_successful_count}/{needed_count} | "
+                            f"Phase 2: {audit_passed_count}/{audit_completed_count} passed "
+                            f"(total: {len(self.fully_validated_pairs) + audit_passed_count})"
+                        )
+                        self._report_progress("streaming_progress", {
+                            "phase": "streaming",
+                            "phase1_count": phase1_successful_count,
+                            "phase2_validated": audit_completed_count,
+                            "phase2_passed": len(self.fully_validated_pairs) + audit_passed_count,
+                        })
+                    else:
+                        logger.warning(f"Audit failed for a QA pair ({audit_completed_count - audit_passed_count} failed so far)")
+
+                except asyncio.TimeoutError:
+                    pass  # No audit result ready
+
+                # Clean up completed tasks from the list
+                pending_gen_tasks = [t for t in pending_gen_tasks if not t.done()]
+
+                # Handle timeout - spawn more workers if stuck
+                # All generation workers have finished but we still need more QAs
+                if phase1_successful_count < needed_count and len(pending_gen_tasks) == 0:
+                    logger.warning("All generation workers done but target not reached. Spawning more...")
+                    for _ in range(min(5, needed_count - phase1_successful_count)):
+                        if not self._stop_requested:
+                            task = asyncio.create_task(
+                                self._worker(worker_id, needed_count, phase1_results_queue)
+                            )
+                            pending_gen_tasks.append(task)
+                            worker_id += 1
+                            workers_spawned += 1
+
+            # Signal audit workers to stop
+            for _ in range(num_audit_workers):
+                await audit_queue.put(None)
+
+            # Wait for audit workers to finish
+            await asyncio.gather(*audit_tasks, return_exceptions=True)
+
+            # Drain any remaining audit results
+            while not validated_queue.empty():
+                try:
+                    validated_qa, passed, regen_count = validated_queue.get_nowait()
+                    audit_completed_count += 1
+                    total_regen_attempts += regen_count
+                    if passed and validated_qa:
+                        audit_passed_count += 1
+                        round_validated.append(validated_qa)  # Collect remaining validated QAs
+                except asyncio.QueueEmpty:
+                    break
+
+            # Cancel remaining generation tasks
+            for task in pending_gen_tasks:
+                if not task.done():
+                    task.cancel()
+
+            # Store final validation summary
+            if not hasattr(self, 'final_validation_summary'):
+                self.final_validation_summary = {
+                    "total_validated": 0,
+                    "passed": 0,
+                    "failed": 0,
+                    "audit_model": self.settings.audit_model,
+                    "final_validation_model": self.settings.final_validation_model,
+                    "required_audit_passes": 5,
+                    "required_answer_passes": self.settings.final_validation_passes,
+                    "total_regeneration_attempts": 0,
+                }
+
+            self.final_validation_summary["total_validated"] += audit_submitted_count
+            self.final_validation_summary["passed"] += audit_passed_count
+            self.final_validation_summary["failed"] += (audit_submitted_count - audit_passed_count)
+            self.final_validation_summary["total_regeneration_attempts"] += total_regen_attempts
+            total_validated = self.final_validation_summary["total_validated"]
+            total_passed = self.final_validation_summary["passed"]
+            self.final_validation_summary["pass_rate"] = f"{total_passed / total_validated:.1%}" if total_validated > 0 else "0%"
+
+            # Add validated QAs from this round to fully_validated_pairs
+            self.fully_validated_pairs.extend(round_validated)
+
+            logger.info(
+                f"Round {backfill_round} complete: {len(round_validated)}/{len(phase1_pairs)} passed Phase 2. "
+                f"Total fully validated: {len(self.fully_validated_pairs)}/{target_count}"
+            )
+
+        # Update valid_qa_pairs to only include fully validated ones
+        self.valid_qa_pairs = self.fully_validated_pairs
+
+        # Write final validated pairs to the final output file
+        if self.fully_validated_pairs:
+            final_output_path = self.output_path.with_suffix('.final.jsonl')
+            with open(final_output_path, "w") as f:
+                for qa in self.fully_validated_pairs:
+                    f.write(qa.to_json_line() + "\n")
+            logger.info(f"Wrote {len(self.fully_validated_pairs)} final validated QA pairs to: {final_output_path}")
+            logger.info(f"Original cross-check validated pairs preserved in: {self.output_path}")
 
         # Update stats
         self.stats.completed_at = datetime.utcnow()
@@ -1360,13 +1847,13 @@ class ParallelPipelineRunner:
                 f"\n{'='*60}\n"
                 f"PIPELINE COMPLETE\n"
                 f"{'='*60}\n"
-                f"Final validated QA pairs: {valid_count}\n"
-                f"Output: {self.output_path}"
+                f"Final validated QA pairs: {valid_count}/{target_count}\n"
+                f"Output: {final_output_path}"
             )
         else:
             logger.warning(
                 f"Parallel pipeline complete but no valid QA pairs remain after final validation. "
-                f"All pairs failed the 5x consecutive validation check. "
+                f"All pairs failed the validation checks. "
                 f"Output: {self.output_path}"
             )
 
@@ -1410,6 +1897,7 @@ async def run_pipeline(
     anthropic_api_key: Optional[str] = None,
     topics: Optional[List[str]] = None,
     schema_max_retries: Optional[int] = None,
+    sanity_check_max_retries: Optional[int] = None,
     qwen_max_retries: Optional[int] = None,
     crosscheck_max_retries: Optional[int] = None,
     final_validation_max_retries: Optional[int] = None,
@@ -1431,6 +1919,7 @@ async def run_pipeline(
                 general_relativity, condensed_matter, nuclear_physics,
                 particle_physics, optics, fluid_mechanics
         schema_max_retries: Max retries for schema validation. Default 3, 0 = unlimited.
+        sanity_check_max_retries: Max retries for sanity checks (dimensional analysis, etc.). Default 5, 0 = unlimited.
         qwen_max_retries: Max retries for Qwen difficulty check. Default 5, 0 = unlimited.
         crosscheck_max_retries: Max retries for cross-check validation. Default 5, 0 = unlimited.
         final_validation_max_retries: Max retries for final 5x blind validation. Default 10, 0 = unlimited.
@@ -1492,6 +1981,7 @@ async def run_pipeline(
             progress_callback=progress_callback,
             topics=physics_topics,
             schema_max_retries=schema_max_retries,
+            sanity_check_max_retries=sanity_check_max_retries,
             qwen_max_retries=qwen_max_retries,
             crosscheck_max_retries=crosscheck_max_retries,
             final_validation_max_retries=final_validation_max_retries,

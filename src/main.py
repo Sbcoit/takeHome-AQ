@@ -136,12 +136,24 @@ def generate(
     )
 
     # Progress tracking
-    progress_data = {"current": 0, "generated": 0, "failed": 0}
+    progress_data = {
+        "current": 0,
+        "generated": 0,
+        "failed": 0,
+        "phase": 1,
+        "phase1_count": 0,
+        "phase2_validated": 0,
+        "phase2_passed": 0,
+    }
 
     def progress_callback(data):
         progress_data["current"] = data.get("valid_count", 0)
         progress_data["generated"] = data.get("stats", {}).get("total_generated", 0)
         progress_data["failed"] = data.get("stats", {}).get("failed", 0)
+        progress_data["phase"] = data.get("phase", 1)
+        progress_data["phase1_count"] = data.get("phase1_count", 0)
+        progress_data["phase2_validated"] = data.get("phase2_validated", 0)
+        progress_data["phase2_passed"] = data.get("phase2_passed", 0)
 
     async def run():
         from .orchestration.pipeline import run_pipeline
@@ -153,7 +165,8 @@ def generate(
             TaskProgressColumn(),
             console=console,
         ) as progress:
-            task = progress.add_task(f"[cyan]Generating QA pairs...", total=count)
+            task = progress.add_task(f"[cyan]Phase 1: Generating QA pairs...", total=count)
+            current_phase = 1
 
             # Run pipeline with progress updates
             async def run_with_updates():
@@ -176,11 +189,59 @@ def generate(
 
             # Update progress while running
             while not pipeline_task.done():
-                progress.update(task, completed=progress_data["current"])
-                await asyncio.sleep(1)
+                phase = progress_data["phase"]
+
+                if phase == "streaming":
+                    # Streaming mode: both phases run concurrently
+                    phase1_count = progress_data["phase1_count"]
+                    phase2_passed = progress_data["phase2_passed"]
+                    phase2_validated = progress_data["phase2_validated"]
+
+                    # Show progress toward final target
+                    # Gen: how many passed Phase 1 / target
+                    # Audit: how many passed Phase 2 / target (the final goal)
+                    if phase2_validated == 0:
+                        audit_status = f"0/{count} (waiting...)"
+                    else:
+                        audit_status = f"{phase2_passed}/{count}"
+
+                    progress.update(
+                        task,
+                        completed=phase2_passed,
+                        description=f"[cyan]Gen: {phase1_count}/{count}[/cyan] | [yellow]Audit: {audit_status}[/yellow]"
+                    )
+                elif phase == 2 and current_phase == 1:
+                    # Transition to Phase 2 (legacy sequential mode)
+                    current_phase = 2
+                    phase1_count = progress_data["phase1_count"]
+                    progress.update(task, total=phase1_count, completed=0)
+                    progress.update(
+                        task,
+                        description=f"[yellow]Phase 2: Auditing ({progress_data['phase2_passed']} passed)..."
+                    )
+                elif phase == 1:
+                    progress.update(task, completed=progress_data["current"])
+                elif phase == 2:
+                    # Phase 2: update progress based on validated count
+                    progress.update(
+                        task,
+                        completed=progress_data["phase2_validated"],
+                        description=f"[yellow]Phase 2: Auditing ({progress_data['phase2_passed']} passed)..."
+                    )
+
+                await asyncio.sleep(0.5)
 
             result = await pipeline_task
-            progress.update(task, completed=count)
+
+            # Final update
+            if progress_data["phase"] == "streaming" or progress_data["phase"] == 2:
+                progress.update(
+                    task,
+                    completed=progress_data["phase2_passed"],
+                    description=f"[green]Complete: {progress_data['phase2_passed']} QA pairs fully validated"
+                )
+            else:
+                progress.update(task, completed=count)
 
             return result
 

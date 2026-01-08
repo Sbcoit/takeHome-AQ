@@ -1,0 +1,23 @@
+<div class="output-files">
+    {% if files %}
+        {% for file in files %}
+        <div class="output-file {% if file.is_current %}current{% endif %}"
+             hx-get="/partials/output-content/{{ file.name }}"
+             hx-target="#output-content"
+             hx-swap="innerHTML"
+             hx-trigger="click">
+            <div class="output-file-info">
+                <span class="output-file-name">{{ file.name }}</span>
+                <span class="output-file-meta">{{ file.modified }}</span>
+            </div>
+            <div class="output-file-stats">
+                <span class="output-file-count">{{ file.count }} pairs</span>
+            </div>
+        </div>
+        {% endfor %}
+    {% else %}
+    <div class="output-empty">
+        No output files yet
+    </div>
+    {% endif %}
+</div>

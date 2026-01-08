@@ -1,0 +1,72 @@
+<div class="output-viewer">
+    <div class="output-viewer-header">
+        <h3>{{ filename }}</h3>
+        <div class="output-viewer-controls">
+            <span class="output-viewer-count">{{ total }} QA pairs</span>
+            <div class="view-toggle">
+                <button class="toggle-btn active" data-view="readable" onclick="toggleOutputView(this, 'readable')">Readable</button>
+                <button class="toggle-btn" data-view="json" onclick="toggleOutputView(this, 'json')">JSON</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Readable View -->
+    <div class="output-viewer-list view-readable active">
+        {% for qa in items %}
+        <div class="output-qa-item">
+            <div class="output-qa-header">
+                <span class="output-qa-index">#{{ qa._index + 1 }}</span>
+                <span class="output-qa-topic">{{ qa.topic if qa.topic else 'physics' }}</span>
+            </div>
+            <div class="output-qa-question math-content">
+                {{ qa.query | texify | safe }}
+            </div>
+            <details class="output-qa-details" ontoggle="if(this.open && window.MathJax) MathJax.typeset();">
+                <summary>View Answer</summary>
+                <div class="output-qa-answer">
+                    <h4>Answer</h4>
+                    <div class="math-content">{{ qa.response_answer | texify | safe }}</div>
+                    <h4>Reasoning</h4>
+                    <div class="reasoning-content math-content">{{ qa.response_reasoning }}</div>
+                </div>
+            </details>
+        </div>
+        {% endfor %}
+    </div>
+
+    <!-- JSON View -->
+    <div class="output-viewer-list view-json">
+        {% for qa in items %}
+        <div class="output-qa-item json-item">
+            <div class="output-qa-header">
+                <span class="output-qa-index">#{{ qa._index + 1 }}</span>
+            </div>
+            <pre class="json-content">{{ qa | tojson(indent=2) }}</pre>
+        </div>
+        {% endfor %}
+    </div>
+</div>
+<script>
+// Toggle between readable and JSON views
+function toggleOutputView(btn, view) {
+    var container = btn.closest('.output-viewer');
+
+    // Update toggle buttons
+    container.querySelectorAll('.toggle-btn').forEach(function(b) { b.classList.remove('active'); });
+    btn.classList.add('active');
+
+    // Update views
+    container.querySelectorAll('.output-viewer-list').forEach(function(v) { v.classList.remove('active'); });
+    container.querySelector('.view-' + view).classList.add('active');
+
+    // Re-render MathJax when switching to readable view
+    if (view === 'readable' && window.MathJax) {
+        MathJax.typeset();
+    }
+}
+
+// Render MathJax for the loaded content
+if (window.MathJax) {
+    MathJax.typeset();
+}
+</script>

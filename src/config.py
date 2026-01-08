@@ -79,11 +79,32 @@ class Settings(BaseSettings):
 
     # Granular regeneration attempt limits (0 = unlimited)
     # Phase 1: Initial generation validation
-    schema_max_retries: int = Field(default=3, alias="SCHEMA_MAX_RETRIES")  # Schema validation retries
+    schema_max_retries: int = Field(default=5, alias="SCHEMA_MAX_RETRIES")  # Schema validation retries
+    sanity_check_max_retries: int = Field(default=5, alias="SANITY_CHECK_MAX_RETRIES")  # Sanity check (dim analysis, etc.) retries
     qwen_max_retries: int = Field(default=20, alias="QWEN_MAX_RETRIES")  # Qwen difficulty check retries
     crosscheck_max_retries: int = Field(default=10, alias="CROSSCHECK_MAX_RETRIES")  # Cross-check validation retries
     # Phase 2: Final validation
     final_validation_max_retries: int = Field(default=10, alias="FINAL_VALIDATION_MAX_RETRIES")  # Final 5x blind validation retries
+
+    # Enhanced validation options
+    # Multi-model sanity check: use multiple AI models for consensus (catches model blind spots)
+    use_multi_model_sanity: bool = Field(default=False, alias="USE_MULTI_MODEL_SANITY")
+    sanity_check_models_str: str = Field(
+        default="anthropic/claude-opus-4,openai/gpt-4o,google/gemini-2.5-pro-preview",
+        alias="SANITY_CHECK_MODELS",
+    )
+    sanity_consensus_mode: str = Field(default="majority", alias="SANITY_CONSENSUS_MODE")  # all, majority, any
+
+    # Problem completeness validation (ensures well-posed problems)
+    use_completeness_check: bool = Field(default=True, alias="USE_COMPLETENESS_CHECK")
+
+    # Symbolic math verification using SymPy (programmatic verification)
+    use_symbolic_math: bool = Field(default=True, alias="USE_SYMBOLIC_MATH")
+
+    @property
+    def sanity_check_models(self) -> List[str]:
+        """Parse sanity check models from comma-separated string."""
+        return [m.strip() for m in self.sanity_check_models_str.split(",") if m.strip()]
 
     # Generation parameters
     samples_per_qwen_check: int = Field(default=5, alias="SAMPLES_PER_QWEN_CHECK")

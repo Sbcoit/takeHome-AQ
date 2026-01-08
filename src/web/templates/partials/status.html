@@ -1,5 +1,18 @@
 {% if state.is_running %}
 <div class="running">
+    {% if state.phase == 2 %}
+    {# Phase 2: Auditing and validating #}
+    <div class="status-info">
+        <span class="status-dot audit"></span>
+        <span class="status-text">Auditing</span>
+        <span class="status-count">{{ state.phase2_validated }}/{{ state.phase1_count }}</span>
+    </div>
+    <div class="progress-track audit">
+        <div class="progress-fill" style="width: {{ state.progress_percent }}%"></div>
+    </div>
+    <span class="status-passed">{{ state.phase2_passed }} passed</span>
+    {% else %}
+    {# Phase 1: Generating #}
     <div class="status-info">
         <span class="status-dot"></span>
         <span class="status-text">Generating</span>
@@ -8,6 +21,7 @@
     <div class="progress-track">
         <div class="progress-fill" style="width: {{ state.progress_percent }}%"></div>
     </div>
+    {% endif %}
 </div>
 {% elif state.error %}
 <div class="error">

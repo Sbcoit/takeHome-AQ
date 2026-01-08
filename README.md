@@ -32,11 +32,11 @@ The system ensures quality through a multi-stage validation pipeline that tests 
                                 │
 ┌─────────────────────────────────────────────────────────────────┐
 │                    Pipeline Orchestrator                         │
-│  - Parallel or Sequential execution modes                       │
+│  - Single-threaded async (concurrent I/O, not parallel CPU)     │
 │  - Coordinates generation → validation → output                  │
+│  - Backfill loop ensures target count is reached                │
 │  - Checkpointing for crash recovery                             │
 │  - Statistics tracking                                          │
-│  - Retries indefinitely until target count is reached           │
 └─────────────────────────────────────────────────────────────────┘
         │                       │                       │
         ▼                       ▼                       ▼
@@ -47,8 +47,9 @@ The system ensures quality through a multi-stage validation pipeline that tests 
 │ TopicSampler  │     │ SchemaValidator │     │ JSONL Writer   │
 │ QAGenerator   │     │ QwenConstraint  │     │ Checkpoint Mgr │
 │ (Claude Opus) │     │ CrossCheckValid │     │ Statistics     │
-└───────────────┘     │ FinalAnswerValid│     └────────────────┘
-                      └─────────────────┘
+│ Two-Step Gen  │     │ DerivationAudit │     │                │
+│ (Problem+Solve)│    │ FinalAnswerValid│     └────────────────┘
+└───────────────┘     └─────────────────┘
                                 │
                       ┌─────────────────┐
                       │ OpenRouter API  │
@@ -56,24 +57,67 @@ The system ensures quality through a multi-stage validation pipeline that tests 
                       └─────────────────┘
 ```
 
+### Pipeline Flow (with Backfill Loop)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  OUTER LOOP: while fully_validated < target_count               │
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ PHASE 1: Generate needed_count QAs                       │   │
+│  │   - Spawn async workers (one per QA needed)              │   │
+│  │   - Two-step generation (problem → independent solve)    │   │
+│  │   - Schema validation                                    │   │
+│  │   - Completeness check (well-posed problem)              │   │
+│  │   - Symbolic math verification (SymPy)                   │   │
+│  │   - Sanity check (physics consistency)                   │   │
+│  │   - Qwen constraint check (not too easy)                 │   │
+│  │   - Cross-check with 4 frontier models                   │   │
+│  │   - Write to dataset.jsonl immediately                   │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                          ↓                                      │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │ PHASE 2: GPT-4 Final Validation                          │   │
+│  │   - Derivation Audit (5 consecutive passes)              │   │
+│  │   - Final Answer Validation (5 consecutive blind solves) │   │
+│  │   - Add passed QAs to fully_validated_pairs              │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                          ↓                                      │
+│  Check: len(fully_validated_pairs) >= target_count?             │
+│    - YES → Exit loop, write final.jsonl                         │
+│    - NO  → Loop back (BACKFILL ROUND 2, 3, ...)                │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Key Behavior**: The pipeline keeps running until `dataset.final.jsonl` contains exactly the number of QAs the user requested. If Phase 2 rejects some QAs, the pipeline automatically generates more to backfill.
+
 ### Components
 
 1. **Generation Pipeline** (`src/generation/`)
    - `TopicSampler`: Samples from 12 physics topics with 100+ subtopics
-   - `QAGenerator`: Uses Claude to generate questions with carefully crafted prompts
+   - `QAGenerator`: Two-step generation process:
+     1. Generate problem statement only (no solution)
+     2. Independently solve the problem (prevents answer bias)
+     3. Generate rubric based on the solution
+   - Self-reported confidence check (must be ≥0.95 to proceed)
 
 2. **Validation Pipeline** (`src/validation/`)
    - `SchemaValidator`: Validates structure and format
-   - `QwenConstraintValidator`: Ensures questions aren't too easy
-   - `CrossCheckValidator`: Tests with multiple frontier models
-   - `CorrectnessJudge`: Verifies physics correctness
-   - `FinalAnswerValidator`: Two-step blind validation (5x consecutive passes required)
+   - `CompletenessValidator`: Ensures problems are well-posed (all variables defined, boundary conditions specified)
+   - `SymbolicMathValidator`: Programmatic verification using SymPy (dimensional analysis, numerical sanity)
+   - `SanityCheckValidator`: AI-based physics sanity checks (dimensional analysis, limiting cases, conservation laws)
+   - `MultiModelSanityValidator`: Optional multi-model consensus for sanity checks (Claude + GPT-4 + Gemini)
+   - `QwenConstraintValidator`: Ensures questions aren't too easy (Qwen <4/5 passes)
+   - `CrossCheckValidator`: Tests with 4 frontier models (need ≥5/20 correct)
+   - `DerivationAuditor`: GPT-4 checks reasoning quality (5 consecutive passes)
+   - `FinalAnswerValidator`: GPT-4 blind solve + compare (5 consecutive passes)
 
 3. **Orchestration** (`src/orchestration/`)
-   - `ParallelPipelineRunner`: Coordinates the entire workflow with parallel workers
-   - Spawns N workers (where N = target QA count) that run concurrently
+   - `ParallelPipelineRunner`: Coordinates the entire workflow
+   - Single-threaded async architecture (concurrent I/O via asyncio)
+   - Backfill loop ensures target count is reached in `final.jsonl`
    - Handles checkpointing, statistics, and error recovery
-   - Automatically spawns replacement workers when failures occur
 
 4. **Interfaces**
    - CLI: `src/main.py` (typer-based)
@@ -81,7 +125,7 @@ The system ensures quality through a multi-stage validation pipeline that tests 
 
 ## Validation Logic
 
-The system implements the **four required validation rules** from the spec:
+The system implements the **four required validation rules** from the spec, plus additional quality checks:
 
 ### 1. No-Images Rule
 - `response_images` must be empty for every data point
@@ -91,25 +135,19 @@ The system implements the **four required validation rules** from the spec:
 Per spec: *"The proportion of cases where Qwen3-max-thinking passes at least 4 out of 5 attempts must not exceed 5%."*
 
 This is a **dataset-level** constraint:
-- For each question, sample `qwen/qwen3-max` (with thinking mode) 5 times
+- For each question, sample `qwen/qwen3-max` 5 times
 - Grade each response using rubric-based evaluation
 - If Qwen passes 4+ out of 5 attempts, the question is marked as "easy"
 - **Dataset constraint**: No more than 5% of questions can be "easy"
 
-**Post-generation filtering**: In parallel mode, all workers complete their validation independently. After all workers finish, the 5% easy question filter is applied:
-- If ≤5% of questions are "easy", all are kept
-- If >5% are "easy", excess easy questions are randomly dropped to meet the threshold
-
-For example, in a 50-question dataset:
-- Up to 2 questions can be "easy" (Qwen 4+/5 passes)
-- If 5 easy questions were generated, 3 would be randomly dropped
-
-### 3. Frontier Model Cross-Check (per-question)
+### 3. Frontier Model Cross-Check - "Council of Judges" (per-question)
 Per spec, test each question with 4 models × 5 samples = 20 total attempts:
-- `deepseek/deepseek-v3-0324` (deepseek-v3.2)
+- `deepseek/deepseek-v3.2`
 - `openai/o4-mini-2025-04-16`
-- `google/gemini-2.5-pro-preview-05-06` (gemini-3-pro)
-- `x-ai/grok-4-0709`
+- `google/gemini-3-pro-preview`
+- `x-ai/grok-4`
+
+This acts as a **council of judges** - four independent frontier models each attempt to solve the problem. This catches model-specific blind spots and ensures the question is genuinely solvable.
 
 **Pass criteria (per-question)**:
 - At least 2 models must have accuracy > 0 (i.e., at least one correct answer among their 5 attempts)
@@ -118,33 +156,33 @@ Per spec, test each question with 4 models × 5 samples = 20 total attempts:
 ### 4. Dataset-Level Correctness Target
 Per spec: *"Across the accepted dataset, the accuracy should be higher than 90%"*
 
-Uses LLM-as-judge to verify each question:
+Ensured through multi-stage validation:
 - The query is well-posed and internally consistent
 - The response_answer is correct
 - The response_reasoning is correct and supports the answer
 
-**Pass criteria**: Dataset-wide accuracy must exceed 90%.
+### 5. Phase 2: GPT-4 Final Validation (Post-Generation)
 
-### 5. Final Answer Validation (Post-Generation Two-Step Blind Check)
+After QA pairs pass Phase 1 (Schema → Qwen → Cross-check), they go through Phase 2:
 
-After all QA pairs pass the initial validation (Schema → Qwen → Cross-check), they go through a rigorous **Final Answer Validation** phase:
+**Step 1: Derivation Audit** (GPT-4)
+- Checks reasoning quality: logical consistency, no contradictions, complete steps
+- Requires **5 consecutive passes**
 
-**Two-Step Blind Judgment Process** (repeated 5 times per QA):
-1. **Step 1 - Blind Solve**: Claude Opus sees **ONLY the question** (no answer, no solution) and independently solves the problem from first principles
-2. **Step 2 - Compare**: Claude then compares its blind-derived answer to the provided answer to check equivalence
+**Step 2: Final Answer Validation** (GPT-4 Blind Solve)
+- GPT-4 solves the problem **without seeing the provided answer**
+- Compares its independently derived answer to the provided answer
+- Requires **5 consecutive passes**
 
-**Why Blind?**: This eliminates confirmation bias. Claude derives its answer before ever seeing the provided answer, ensuring truly independent verification.
-
-**Pass Criteria**: A QA pair must pass **all 5 consecutive** blind judgments to be accepted.
+**Why Blind?**: Eliminates confirmation bias. GPT-4 derives its answer before ever seeing the provided answer.
 
 **On Failure - Full Pipeline Re-validation**:
-If final validation fails:
-1. Extract feedback from the failed judgments (what answer Claude derived, why they don't match)
-2. Regenerate the QA pair with the corrected answer
-3. **Re-run the FULL validation pipeline** (Qwen check → Cross-check → Final 5x validation)
-4. Repeat up to 15 times until the QA passes or is discarded
-
-This ensures that any corrected answer doesn't accidentally become "too easy" or fail other validation stages.
+If Phase 2 validation fails:
+1. Extract feedback from the failed validation
+2. Regenerate the QA pair with feedback
+3. **Re-run Phase 1 validation** (Qwen check → Cross-check)
+4. Re-run Phase 2 validation
+5. Repeat until pass or max retries reached
 
 ### How "Correct" Is Scored
 
@@ -157,20 +195,6 @@ The system uses a **10-point rubric-based grading system**:
 **Pass Criteria**:
 - **Qwen (STRICT)**: Must score ≥7/10 AND ≥2/3 on final answer
 - **Cross-check (GENEROUS)**: Must score ≥6/10 AND ≥2/3 on final answer
-
-**Grading philosophy for cross-check (generous)**:
-- Accept equivalent answers (different but mathematically equal forms, reasonable rounding)
-- Accept valid alternative approaches that reach the same answer
-- Focus on whether the physics is RIGHT, not exact string matching
-- Minor calculation errors are acceptable if the method is correct
-
-**Grading philosophy for Qwen check (strict)**:
-- Do NOT give benefit of the doubt
-- Missing steps = missing points
-- Wrong reasoning with right answer = max 3 points (answer only)
-- Right reasoning with wrong answer = max 7 points
-
-The judge uses low temperature (0.1) for consistent evaluation and outputs structured JSON with detailed explanations.
 
 ## How to Run End-to-End
 
@@ -204,10 +228,10 @@ cp .env.example .env
 ### Running via CLI
 
 ```bash
-# Generate 50 QA pairs in parallel (default)
+# Generate 50 QA pairs (default)
 python -m src.main generate
 
-# Generate custom count with parallel workers
+# Generate custom count
 python -m src.main generate --count 100 --output output/my_dataset.jsonl
 
 # Generate 5 QAs for a specific topic
@@ -216,14 +240,14 @@ python -m src.main generate --count 5 --topic quantum_mechanics
 # Generate with mixed topics (each worker gets a different topic)
 python -m src.main generate --count 5 --mix-topics
 
-# Customize individual retry limits (defaults: schema=3, qwen=5, crosscheck=5, final=10)
+# Customize individual retry limits (defaults: schema=3, qwen=20, crosscheck=10, final=10)
 python -m src.main generate --count 5 --schema-retries 5 --qwen-retries 8 --crosscheck-retries 8 --final-retries 15
 
 # Set unlimited retries for specific stages (0 = unlimited)
 python -m src.main generate --count 5 --qwen-retries 0 --final-retries 0
 
 # With verbose logging
-python -m src.main generate --count 2 --verbose
+python -m src.main generate --count 25 --verbose
 
 # Show available topics
 python -m src.main topics
@@ -235,14 +259,16 @@ python -m src.main info
 python -m src.main validate output/dataset.jsonl
 ```
 
-**Parallel Execution**: The pipeline spawns N workers (where N = requested QA count) that run concurrently. Each worker independently generates and validates one QA pair. Failed workers are automatically replaced until the target count is reached.
+**Execution Model**: Single-threaded async (concurrent I/O). Workers run concurrently on a single thread via asyncio, with concurrency limited by semaphore and rate limiter.
 
-**Retry Behavior** (granular per-stage limits):
-- **Schema validation**: Up to 3 retries. Configure with `--schema-retries`.
-- **Qwen difficulty check**: Up to 5 retries. Configure with `--qwen-retries`.
-- **Cross-check validation**: Up to 5 retries. Configure with `--crosscheck-retries`.
-- **Final 5x blind validation**: Up to 10 retries. Configure with `--final-retries`.
-- Set any limit to 0 for unlimited retries. All flags can be used together.
+**Output Files**:
+- `output/dataset.jsonl`: QAs that passed Phase 1 (Qwen + Cross-check)
+- `output/dataset.final.jsonl`: QAs that passed **both** Phase 1 and Phase 2 (fully validated)
+- `output/dataset.failed.jsonl`: QAs that passed Phase 1 but failed Phase 2 (for debugging)
+
+**Note**: The `output/` directory is **automatically created** when the pipeline runs. When you clone this repo and run the pipeline, it will create the output folder in your project directory - no manual setup required.
+
+**Backfill Behavior**: If you request 10 QAs and Phase 2 rejects 3, the pipeline automatically generates 3 more and validates them until `final.jsonl` has exactly 10.
 
 ### Running via Web UI
 
@@ -294,65 +320,55 @@ The output is a JSONL file with one JSON object per line:
 
 ## Design Decisions & Tradeoffs
 
-### 1. Dataset-Level Qwen Constraint
-**Decision**: Track "easy" questions at the dataset level, allow up to 5%
-**Rationale**: Per the spec, this is a dataset-level constraint. Early questions can be easy; we only reject once we'd exceed 5%.
-**Tradeoff**: Slightly more complex bookkeeping, but matches spec exactly.
+### 1. Two-Step Generation Process
+**Decision**: Generate problem first, then solve independently
+**Rationale**: Prevents the model from creating problems where the derivation doesn't support the stated answer. The solver sees only the problem, not how it was created.
+**Tradeoff**: 2x generation API calls, but much higher answer accuracy.
 
-### 2. JSONL Output Format
+### 2. Self-Reported Confidence Check
+**Decision**: Require solver confidence ≥0.95 to proceed
+**Rationale**: Low confidence indicates ambiguous or ill-posed problems that will likely fail validation anyway.
+**Tradeoff**: Relies on model's self-assessment (not externally validated), but works as a quick filter.
+
+### 3. Single-Threaded Async Architecture
+**Decision**: Use asyncio with concurrent I/O (not multi-threading)
+**Rationale**: Pipeline is I/O-bound (waiting on API calls). Async is efficient for this and avoids threading complexity.
+**Tradeoff**: No CPU parallelism, but CPU work (JSON parsing) is minimal.
+
+### 4. Backfill Loop for Target Count
+**Decision**: Keep generating until `final.jsonl` reaches target count
+**Rationale**: Users expect exactly N QAs when they request N. Phase 2 rejections shouldn't result in fewer outputs.
+**Tradeoff**: Variable runtime, but guaranteed output count.
+
+### 5. Phase 2 GPT-4 Validation (Beyond Spec)
+**Decision**: Add derivation audit + blind answer validation after cross-check
+**Rationale**: Cross-check validates solvability, but not reasoning quality. GPT-4 audit catches flawed derivations.
+**Tradeoff**: Significant additional API cost and time, but higher quality outputs. This is optional per spec.
+
+### 6. JSONL Output Format
 **Decision**: JSONL (one JSON object per line)
 **Rationale**: Streaming-friendly, handles partial failures gracefully, standard ML dataset format.
 **Tradeoff**: Slightly larger than compressed formats, but human-readable.
 
-### 3. LLM-as-Judge for Correctness
-**Decision**: Use a strong model (Claude Sonnet) as judge
+### 7. LLM-as-Judge for Correctness
+**Decision**: Use Claude Sonnet as judge for rubric-based grading
 **Rationale**: Physics correctness requires domain expertise; string matching won't work for equivalent symbolic expressions.
 **Tradeoff**: Additional API cost per question.
 
-### 4. Parallel Worker Architecture
-**Decision**: Full async with parallel worker pool using asyncio
-**Rationale**: Spawning N workers for N requested QAs maximizes throughput by running all pipelines concurrently.
-**Tradeoff**: Higher peak API usage, but dramatically faster overall execution. Rate limiting is automatically scaled.
+### 8. Dataset-Level Qwen Constraint
+**Decision**: Track "easy" questions at the dataset level, allow up to 5%
+**Rationale**: Per the spec, this is a dataset-level constraint.
+**Tradeoff**: Slightly more complex bookkeeping, but matches spec exactly.
 
-### 5. Post-Generation Filtering for 5% Easy Threshold
-**Decision**: Accept all valid questions during parallel generation, filter at the end
-**Rationale**: In parallel mode, workers can't coordinate in real-time. Post-filtering ensures we meet the 5% threshold.
-**Tradeoff**: May generate slightly more questions than needed if many are "easy".
-
-### 6. htmx for Web UI
+### 9. htmx for Web UI
 **Decision**: htmx instead of React/Vue
 **Rationale**: Lightweight, no build step, server-rendered HTML with interactivity.
 **Tradeoff**: Less rich interactivity, but much simpler to maintain.
 
-### 7. Checkpoint System
-**Decision**: Periodic checkpointing with recovery
-**Rationale**: Long-running generation shouldn't lose all progress on failure.
+### 10. Checkpoint System
+**Decision**: Write QAs to disk immediately after Phase 1 validation
+**Rationale**: Long-running generation shouldn't lose progress on failure.
 **Tradeoff**: Small disk I/O overhead.
-
-### 8. High Retry Count for Rate Limits
-**Decision**: Default 30 retries with exponential backoff (capped at 30s)
-**Rationale**: OpenRouter rate limits can cause transient failures, especially with Qwen. Higher retries ensure 30+ QA batches complete reliably.
-**Tradeoff**: Slower recovery from permanent failures, but much better reliability for large batches.
-
-### 9. Granular Per-Stage Retry Limits
-**Decision**: Separate configurable retry limits for each validation stage (schema=3, qwen=5, crosscheck=5, final=10)
-**Rationale**: Different stages have different failure modes. Schema failures are rare but should fail fast. Qwen difficulty and cross-check answer validation may need more attempts. Final validation may require the most retries since it's the strictest.
-**Tradeoff**: More configuration options, but allows fine-tuned control over generation behavior. Set any limit to 0 for unlimited retries.
-
-### 10. Two-Step Blind Final Validation
-**Decision**: Claude solves the problem blind (without seeing the answer), then compares its solution
-**Rationale**: Eliminates confirmation bias. If Claude sees the answer first, it may unconsciously validate it even if wrong.
-**Tradeoff**: 2x API calls per judgment (solve + compare), but much more rigorous verification.
-
-### 11. Full Pipeline Re-validation After Regeneration
-**Decision**: Regenerated QAs go through the full pipeline again (Qwen → Cross-check → Final 5x)
-**Rationale**: A corrected answer might accidentally become "too easy" or fail other validation stages.
-**Tradeoff**: More API calls, but ensures regenerated QAs meet all quality criteria.
-
-### 12. Configurable Retry Limits with Optional Unlimited Mode
-**Decision**: Each validation stage has its own configurable retry limit, with 0 meaning unlimited
-**Rationale**: Users can balance between guaranteed results (unlimited) and fail-fast behavior (limited retries) per stage.
-**Tradeoff**: Unlimited mode may take longer, but guarantees results. Limited mode is faster but may skip difficult questions.
 
 ## What I'd Do With More Time
 
@@ -372,31 +388,31 @@ The output is a JSONL file with one JSON object per line:
 
 ## Already Implemented
 
-- **Parallel Worker Execution**: Spawns N concurrent workers for N requested QAs, dramatically improving throughput. Each worker runs the full pipeline independently, with automatic replacement of failed workers.
+- **Two-Step Generation**: Problem generation separate from solution to prevent answer bias
 
-- **Granular Retry Limits**: Each validation stage has its own configurable retry limit (`--schema-retries`, `--qwen-retries`, `--crosscheck-retries`, `--final-retries`). Set to 0 for unlimited retries. Data is written to disk immediately so nothing is lost on failure.
+- **Backfill Loop**: Pipeline automatically generates more QAs if Phase 2 rejects some, ensuring target count is reached
 
-- **Post-Generation 5% Easy Filter**: Easy questions are tracked during parallel generation and filtered at the end to meet the 5% dataset-level threshold.
+- **Phase 2 GPT-4 Validation**: Derivation audit (5 passes) + blind answer validation (5 passes) for high-quality outputs
 
-- **Mixed Topic Mode**: `--mix-topics` flag distributes different physics topics across parallel workers for diverse datasets.
+- **Full Pipeline Re-validation**: Regenerated QAs go through the entire pipeline again (Qwen → Cross-check → Phase 2)
 
-- **Adaptive Difficulty Feedback Loop**: Validation failure reasons are fed back into `regenerate_with_feedback()` to improve subsequent attempts (e.g., "Question was too easy - Qwen solved it 4/5 times")
+- **Granular Retry Limits**: Each validation stage has its own configurable retry limit (`--schema-retries`, `--qwen-retries`, `--crosscheck-retries`, `--final-retries`). Set to 0 for unlimited retries.
 
-- **Topic Diversity Tracking**: `TopicSampler` tracks used subtopics and prefers unused ones via `prefer_diverse=True`, with coverage statistics available via `get_coverage_stats()`
+- **Mixed Topic Mode**: `--mix-topics` flag distributes different physics topics across workers for diverse datasets
 
-- **10-Point Rubric-Based Grading**: Structured grading with 3 points for final answer and 7 points for key steps (3-7 steps). Pass criteria differ for Qwen (strict: ≥7/10) vs cross-check (generous: ≥6/10).
+- **Adaptive Difficulty Feedback Loop**: Validation failure reasons are fed back into `regenerate_with_feedback()` to improve subsequent attempts
 
-- **Robust Rate Limit Handling**: 30 retries with exponential backoff (capped at 30s) ensures reliable generation of 30+ QA batches despite OpenRouter rate limits.
+- **Topic Diversity Tracking**: `TopicSampler` tracks used subtopics and prefers unused ones
 
-- **Escalating Difficulty Hints**: When questions are too easy, regeneration includes progressively harder requirements like "require perturbation theory" or "add topological considerations".
+- **Symbolic Math Verification**: SymPy-based programmatic verification for dimensional analysis, numerical sanity, and expression equivalence
 
-- **Two-Step Blind Final Validation**: After cross-check validation, Claude Opus performs a rigorous two-step blind judgment 5 times:
-  1. Blind solve (sees only the question, derives answer independently)
-  2. Compare (checks if blind-derived answer matches provided answer)
+- **Problem Completeness Checking**: AI-based validation that problems are well-posed (all variables defined, boundary conditions specified, unambiguous physical context)
 
-  This eliminates confirmation bias and ensures truly independent verification.
+- **Multi-Model Sanity Check (Optional Council)**: Consensus-based sanity checking using multiple AI models (Claude + GPT-4 + Gemini) with configurable consensus modes (`all`, `majority`, `any`) to catch model-specific blind spots
 
-- **Full Pipeline Re-validation on Failure**: When final validation fails, the regenerated QA goes through the entire pipeline again (Qwen → Cross-check → Final 5x) to ensure correctness, difficulty, and validity are all maintained.
+- **10-Point Rubric-Based Grading**: Structured grading with 3 points for final answer and 7 points for key steps
+
+- **Robust Rate Limit Handling**: Retries with exponential backoff ensures reliable generation despite rate limits
 
 ## Project Structure
 
@@ -412,15 +428,20 @@ takeHome-AQ/
 │   │   └── client.py              # OpenRouter async client
 │   ├── generation/
 │   │   ├── topics.py              # Physics topic sampling
-│   │   └── generator.py           # QA generation
+│   │   └── generator.py           # Two-step QA generation
 │   ├── validation/
+│   │   ├── __init__.py            # Validation exports
 │   │   ├── schema.py              # Schema validation
+│   │   ├── completeness_check.py  # Problem well-posedness
+│   │   ├── symbolic_math.py       # SymPy verification
+│   │   ├── sanity_check.py        # Physics sanity checks
 │   │   ├── qwen_check.py          # Qwen constraint
 │   │   ├── crosscheck.py          # Multi-model check
 │   │   ├── correctness.py         # LLM-as-judge
-│   │   └── final_answer.py        # Two-step blind validation
+│   │   ├── derivation_audit.py    # GPT-4 reasoning audit
+│   │   └── final_answer.py        # GPT-4 blind validation
 │   ├── orchestration/
-│   │   └── pipeline.py            # Pipeline runner
+│   │   └── pipeline.py            # Pipeline runner with backfill
 │   └── web/
 │       ├── app.py                 # FastAPI app
 │       ├── templates/             # Jinja2 templates

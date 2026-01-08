@@ -55,12 +55,22 @@ NEVER use Unicode symbols - ALWAYS use LaTeX."""
 
 Your solution must be:
 - RIGOROUS: Show ALL steps, no hand-waving
-- VERIFIED: Check dimensions at each step
+- DIMENSIONALLY VERIFIED: Track units at EVERY step (this is MANDATORY)
 - COMPLETE: Include all intermediate algebra
 - CORRECT: Double-check your final answer
 
+MANDATORY DIMENSIONAL ANALYSIS PROTOCOL:
+You MUST track dimensions throughout your derivation. For EACH equation:
+1. Write the dimensional formula [M^a L^b T^c ...] for BOTH sides
+2. Verify they match BEFORE proceeding to the next step
+3. If dimensions don't match, you have an ERROR - fix it before continuing
+
+Example of proper dimensional tracking:
+"F = ma → [M L T^{-2}] = [M][L T^{-2}] ✓"
+"E = ½mv² → [M L² T^{-2}] = [M][L T^{-1}]² = [M L² T^{-2}] ✓"
+
 CRITICAL VERIFICATION CHECKLIST (do this BEFORE finalizing):
-1. Does your final answer have correct units/dimensions?
+1. Does your final answer have correct units/dimensions? (SHOW THE CHECK)
 2. Does it behave correctly in limiting cases (e.g., as m→0, as T→∞)?
 3. Is the sign correct (check physical intuition)?
 4. Did you include all factors (check for missing 2, π, etc.)?
@@ -103,25 +113,59 @@ PROBLEM:
 
 REQUIREMENTS:
 1. Show ALL steps - no hand-waving or "it can be shown that"
-2. Check dimensions at EACH step
+2. Track dimensions at EACH step (write [M^a L^b T^c] explicitly)
 3. Verify limiting cases where applicable
 4. Double-check algebra and signs
 5. State your final answer clearly
 
-VERIFICATION CHECKLIST (do this BEFORE giving your final answer):
-- [ ] Units/dimensions are correct
-- [ ] Limiting cases make physical sense
-- [ ] Signs are correct (check intuition)
-- [ ] No missing factors of 2, π, etc.
+==== MANDATORY SANITY CHECKS (do ALL of these BEFORE finalizing) ====
+
+1. DIMENSIONAL ANALYSIS (catches ~80% of errors):
+   - Write the expected dimensions of the answer (e.g., [Energy] = [M L² T⁻²])
+   - Verify your answer has these exact dimensions
+   - If dimensions don't match, your answer is WRONG - fix it
+
+2. LIMITING CASES:
+   - Check at least 2 limiting cases (e.g., as parameter → 0, as parameter → ∞)
+   - Does the answer reduce to known results in these limits?
+   - Example: As perturbation → 0, must recover unperturbed case
+
+3. SIGN CHECK:
+   - Is the sign physically reasonable?
+   - Energies should be real, probabilities must be positive (0-1)
+   - Attractive forces should give negative potential energy
+   - Repulsive potentials should give positive scattering lengths
+
+4. ORDER OF MAGNITUDE:
+   - Is the numerical scale plausible?
+   - Nothing physical can be smaller than Planck length (~10⁻³⁵ m)
+   - Nothing faster than light, nothing colder than 0 K
+
+5. INTERNAL CONSISTENCY:
+   - Do intermediate steps agree with the final answer?
+   - Re-derive a key step to verify no algebraic errors
+
+======================================================================
 
 LATEX: Use "\\\\frac{{{{a}}}}{{{{b}}}}", "\\\\alpha", etc.
 
 Respond with JSON:
 {{{{
     "response_answer": "**\\\\frac{{{{symbolic}}}}{{{{answer}}}}**",
-    "response_reasoning": "## Solution\\n\\n### Setup\\n[Define variables]\\n\\n### Derivation\\n1. [Step 1]\\n2. [Step 2]...\\n\\n### Verification\\n- Dimensions: [check]\\n- Limiting case: [check]\\n\\n### Final Answer\\n**answer**",
-    "dimensional_check": "correct/incorrect with explanation",
-    "limiting_cases_checked": ["case1: result makes sense because...", "case2: ..."],
+    "response_reasoning": "## Solution\\n\\n### Setup\\n[Define variables and their dimensions]\\n\\n### Derivation\\n1. [Step with dimensional check]\\n2. [Step with dimensional check]...\\n\\n### Sanity Checks\\n#### Dimensional Analysis\\n[Show expected vs actual dimensions]\\n#### Limiting Cases\\n[Check at least 2 limits]\\n#### Sign Check\\n[Verify sign is physical]\\n#### Internal Consistency\\n[Verify intermediate steps match final]\\n\\n### Final Answer\\n**answer**",
+    "dimensional_check": {{{{
+        "expected_dimensions": "[M^a L^b T^c ...]",
+        "actual_dimensions": "[M^a L^b T^c ...]",
+        "match": true/false,
+        "explanation": "Detailed dimensional analysis"
+    }}}},
+    "limiting_cases_checked": [
+        {{{{"case": "parameter → 0", "result": "reduces to known X", "physical": true}}}},
+        {{{{"case": "parameter → ∞", "result": "approaches Y", "physical": true}}}}
+    ],
+    "sign_check": {{{{"correct": true/false, "explanation": "why sign is physical"}}}},
+    "order_of_magnitude_check": {{{{"plausible": true/false, "explanation": "scale is reasonable because..."}}}},
+    "internal_consistency": {{{{"consistent": true/false, "explanation": "intermediate steps verified"}}}},
     "confidence": 0.0-1.0
 }}}}"""
 
@@ -613,19 +657,54 @@ You must solve this problem from FIRST PRINCIPLES. Do NOT just tweak the old ans
 
 REQUIREMENTS:
 1. Show ALL steps - no hand-waving
-2. Check dimensions at EACH step
+2. Track dimensions at EACH step (write [M^a L^b T^c] explicitly)
 3. Verify limiting cases
 4. Double-check algebra and signs
 5. State your final answer clearly
+
+==== MANDATORY SANITY CHECKS (do ALL of these BEFORE finalizing) ====
+
+1. DIMENSIONAL ANALYSIS (catches ~80% of errors):
+   - Write the expected dimensions of the answer
+   - Verify your answer has these exact dimensions
+   - If dimensions don't match, your answer is WRONG
+
+2. LIMITING CASES:
+   - Check at least 2 limiting cases
+   - Does the answer reduce to known results in these limits?
+
+3. SIGN CHECK:
+   - Is the sign physically reasonable?
+   - Energies should be real, probabilities must be positive (0-1)
+
+4. ORDER OF MAGNITUDE:
+   - Is the numerical scale plausible?
+   - Nothing smaller than Planck length, nothing faster than light
+
+5. INTERNAL CONSISTENCY:
+   - Do intermediate steps agree with the final answer?
+
+======================================================================
 
 LATEX: Use "\\\\frac{{{{a}}}}{{{{b}}}}", "\\\\alpha", etc.
 
 Respond with JSON:
 {{{{
     "response_answer": "**\\\\frac{{{{symbolic}}}}{{{{answer}}}}**",
-    "response_reasoning": "## Solution\\n\\n### Setup\\n[Define variables]\\n\\n### Derivation\\n[Show ALL steps]\\n\\n### Verification\\n- Dimensions: [check]\\n- Limiting case: [check]\\n\\n### Final Answer\\n**answer**",
-    "dimensional_check": "correct/incorrect with explanation",
-    "limiting_cases_checked": ["case1", "case2"],
+    "response_reasoning": "## Solution\\n\\n### Setup\\n[Define variables and dimensions]\\n\\n### Derivation\\n[Show ALL steps with dimensional checks]\\n\\n### Sanity Checks\\n[All 5 checks]\\n\\n### Final Answer\\n**answer**",
+    "dimensional_check": {{{{
+        "expected_dimensions": "[M^a L^b T^c ...]",
+        "actual_dimensions": "[M^a L^b T^c ...]",
+        "match": true/false,
+        "explanation": "Detailed dimensional analysis"
+    }}}},
+    "limiting_cases_checked": [
+        {{{{"case": "parameter → 0", "result": "reduces to X", "physical": true}}}},
+        {{{{"case": "parameter → ∞", "result": "approaches Y", "physical": true}}}}
+    ],
+    "sign_check": {{{{"correct": true/false, "explanation": "why sign is physical"}}}},
+    "order_of_magnitude_check": {{{{"plausible": true/false, "explanation": "scale is reasonable"}}}},
+    "internal_consistency": {{{{"consistent": true/false, "explanation": "steps verified"}}}},
     "confidence": 0.0-1.0
 }}}}"""
 
