@@ -1,11 +1,13 @@
 """FastAPI web application for the Physics QA Generator."""
 
+import asyncio
 import json
 import logging
 import os
+import re
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Set
 
 from fastapi import FastAPI, Request, BackgroundTasks, HTTPException, Form
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -55,8 +57,13 @@ class PipelineState:
         self.logs: List[str] = []
         self.error: Optional[str] = None
         self.topics: Optional[List[str]] = None
-        self.mix_topics: bool = False
         self.output_path: str = "output/dataset.jsonl"
+        # Per-worker log tracking
+        self.worker_logs: Dict[int, List[str]] = {}
+        self.active_workers: Set[int] = set()
+        # Stop control
+        self.stop_requested: bool = False
+        self.pipeline_task: Optional[asyncio.Task] = None  # Reference to running task
 
     def reset(self):
         self.is_running = False
@@ -68,13 +75,34 @@ class PipelineState:
         self.logs = []
         self.error = None
         self.topics = None
-        self.mix_topics = False
         self.output_path = "output/dataset.jsonl"
+        self.schema_retries = None
+        self.qwen_retries = None
+        self.crosscheck_retries = None
+        self.final_retries = None
+        # Reset per-worker tracking
+        self.worker_logs = {}
+        self.active_workers = set()
+        # Reset stop control
+        self.stop_requested = False
+        self.pipeline_task = None
 
     def add_log(self, message: str):
         self.logs.append(message)
         if len(self.logs) > 500:
             self.logs = self.logs[-500:]
+
+        # Parse worker ID from message and track per-worker logs
+        match = re.search(r'\[Worker (\d+)\]', message)
+        if match:
+            worker_id = int(match.group(1))
+            self.active_workers.add(worker_id)
+            if worker_id not in self.worker_logs:
+                self.worker_logs[worker_id] = []
+            self.worker_logs[worker_id].append(message)
+            # Keep per-worker logs bounded
+            if len(self.worker_logs[worker_id]) > 100:
+                self.worker_logs[worker_id] = self.worker_logs[worker_id][-100:]
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -90,8 +118,8 @@ class PipelineState:
             "recent_qa_count": len(self.recent_qa),
             "error": self.error,
             "topics": self.topics,
-            "mix_topics": self.mix_topics,
             "output_path": self.output_path,
+            "active_workers": sorted(self.active_workers),
         }
 
 
@@ -112,7 +140,11 @@ class GenerateRequest(BaseModel):
     count: int = 50
     output_path: str = "output/dataset.jsonl"
     topics: Optional[List[str]] = None
-    mix_topics: bool = False
+    # Granular retry limits (None = use default, 0 = unlimited)
+    schema_retries: Optional[int] = None
+    qwen_retries: Optional[int] = None
+    crosscheck_retries: Optional[int] = None
+    final_retries: Optional[int] = None
 
 
 def progress_callback(data: Dict[str, Any]):
@@ -121,7 +153,15 @@ def progress_callback(data: Dict[str, Any]):
     pipeline_state.stats = data.get("stats", {})
 
 
-async def run_pipeline_async(count: int, output_path: str, topics: Optional[List[str]] = None, mix_topics: bool = False):
+async def run_pipeline_async(
+    count: int,
+    output_path: str,
+    topics: Optional[List[str]] = None,
+    schema_retries: Optional[int] = None,
+    qwen_retries: Optional[int] = None,
+    crosscheck_retries: Optional[int] = None,
+    final_retries: Optional[int] = None,
+):
     """Run the pipeline in the background."""
     from dotenv import load_dotenv
 
@@ -138,6 +178,11 @@ async def run_pipeline_async(count: int, output_path: str, topics: Optional[List
         return
 
     openai_api_key = os.environ.get("OPENAI_API_KEY")
+    anthropic_api_key = os.environ.get("ANTHROPIC_API_KEY")
+
+    def check_stop_requested() -> bool:
+        """Callback to check if stop was requested."""
+        return pipeline_state.stop_requested
 
     try:
         from ..orchestration.pipeline import run_pipeline
@@ -148,12 +193,21 @@ async def run_pipeline_async(count: int, output_path: str, topics: Optional[List
             output_path=output_path,
             progress_callback=progress_callback,
             openai_api_key=openai_api_key,
+            anthropic_api_key=anthropic_api_key,
             topics=topics,
-            mix_topics=mix_topics,
+            schema_max_retries=schema_retries,
+            qwen_max_retries=qwen_retries,
+            crosscheck_max_retries=crosscheck_retries,
+            final_validation_max_retries=final_retries,
+            stop_check=check_stop_requested,
         )
 
         pipeline_state.stats = result.get("stats", {})
         logger.info(f"Pipeline complete: {pipeline_state.current_count} valid pairs")
+
+    except asyncio.CancelledError:
+        logger.info("Pipeline cancelled by user")
+        pipeline_state.error = None  # Not an error, just stopped
 
     except Exception as e:
         pipeline_state.error = str(e)
@@ -161,6 +215,7 @@ async def run_pipeline_async(count: int, output_path: str, topics: Optional[List
 
     finally:
         pipeline_state.is_running = False
+        pipeline_state.pipeline_task = None
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -176,6 +231,8 @@ async def dashboard(request: Request):
             "request": request,
             "state": pipeline_state.to_dict(),
             "topics": topics,
+            "workers": sorted(pipeline_state.active_workers),
+            "logs": pipeline_state.logs[-100:],
         }
     )
 
@@ -203,13 +260,22 @@ async def get_topics():
     return JSONResponse({"topics": topics})
 
 
+def generate_unique_output_path(base_dir: str = "output") -> str:
+    """Generate a unique timestamped output file path."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{base_dir}/dataset_{timestamp}.jsonl"
+
+
 @app.post("/api/generate")
 async def start_generation(
     background_tasks: BackgroundTasks,
     count: int = Form(default=50),
-    output_path: str = Form(default="output/dataset.jsonl"),
+    output_path: Optional[str] = Form(default=None),
     topics: Optional[str] = Form(default=None),
-    mix_topics: bool = Form(default=False),
+    schema_retries: Optional[str] = Form(default=None),
+    qwen_retries: Optional[str] = Form(default=None),
+    crosscheck_retries: Optional[str] = Form(default=None),
+    final_retries: Optional[str] = Form(default=None),
 ):
     """Start the generation pipeline."""
     if pipeline_state.is_running:
@@ -219,16 +285,49 @@ async def start_generation(
     pipeline_state.is_running = True
     pipeline_state.run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     pipeline_state.target_count = count
+
+    # Generate unique timestamped filename if not specified
+    if not output_path or output_path == "output/dataset.jsonl":
+        output_path = generate_unique_output_path()
+
     pipeline_state.output_path = output_path
 
     topic_list = None
     if topics and topics.strip():
         topic_list = [t.strip() for t in topics.split(",") if t.strip()]
 
-    pipeline_state.topics = topic_list
-    pipeline_state.mix_topics = mix_topics
+    # Parse retry values - empty string means use default (None), "0" means unlimited
+    def parse_retry(val: Optional[str]) -> Optional[int]:
+        if val is None or val.strip() == "":
+            return None  # Use default
+        return int(val)
 
-    background_tasks.add_task(run_pipeline_async, count, output_path, topic_list, mix_topics)
+    schema_retries_int = parse_retry(schema_retries)
+    qwen_retries_int = parse_retry(qwen_retries)
+    crosscheck_retries_int = parse_retry(crosscheck_retries)
+    final_retries_int = parse_retry(final_retries)
+
+    pipeline_state.topics = topic_list
+    pipeline_state.schema_retries = schema_retries_int
+    pipeline_state.qwen_retries = qwen_retries_int
+    pipeline_state.crosscheck_retries = crosscheck_retries_int
+    pipeline_state.final_retries = final_retries_int
+
+    logger = logging.getLogger(__name__)
+    logger.info(f"Starting with retry limits: schema={schema_retries_int}, qwen={qwen_retries_int}, crosscheck={crosscheck_retries_int}, final={final_retries_int}")
+
+    # Create and store the task so we can cancel it later
+    pipeline_state.pipeline_task = asyncio.create_task(
+        run_pipeline_async(
+            count,
+            output_path,
+            topic_list,
+            schema_retries_int,
+            qwen_retries_int,
+            crosscheck_retries_int,
+            final_retries_int,
+        )
+    )
 
     return JSONResponse({
         "status": "started",
@@ -238,18 +337,28 @@ async def start_generation(
 
 @app.post("/api/stop")
 async def stop_generation():
-    """Request the pipeline to stop."""
+    """Immediately stop the pipeline."""
     if not pipeline_state.is_running:
         raise HTTPException(status_code=400, detail="Pipeline is not running")
 
-    logging.getLogger(__name__).info("Stop requested")
-    return JSONResponse({"status": "stop_requested"})
+    logger = logging.getLogger(__name__)
+
+    # Set flag first
+    pipeline_state.stop_requested = True
+
+    # Cancel the task immediately
+    if pipeline_state.pipeline_task and not pipeline_state.pipeline_task.done():
+        pipeline_state.pipeline_task.cancel()
+        logger.info("Pipeline stopped immediately")
+
+    pipeline_state.is_running = False
+    return JSONResponse({"status": "stopped"})
 
 
 @app.get("/api/output")
 async def get_output(limit: int = 10, offset: int = 0):
-    """Get generated QA pairs from the output file."""
-    output_path = Path("output/dataset.jsonl")
+    """Get generated QA pairs from the current output file."""
+    output_path = Path(pipeline_state.output_path)
 
     if not output_path.exists():
         return JSONResponse({"items": [], "total": 0})
@@ -278,7 +387,7 @@ async def get_output(limit: int = 10, offset: int = 0):
 @app.get("/qa/{index}", response_class=HTMLResponse)
 async def view_qa(request: Request, index: int):
     """View a specific QA pair."""
-    output_path = Path("output/dataset.jsonl")
+    output_path = Path(pipeline_state.output_path)
 
     if not output_path.exists():
         raise HTTPException(status_code=404, detail="No output file found")
@@ -333,7 +442,7 @@ async def partial_logs(request: Request):
 @app.get("/partials/qa-list", response_class=HTMLResponse)
 async def partial_qa_list(request: Request, limit: int = 10):
     """Partial template for QA list."""
-    output_path = Path("output/dataset.jsonl")
+    output_path = Path(pipeline_state.output_path)
     items = []
 
     if output_path.exists():
@@ -352,6 +461,45 @@ async def partial_qa_list(request: Request, limit: int = 10):
         {
             "request": request,
             "items": items,
+        }
+    )
+
+
+@app.get("/api/workers")
+async def get_workers():
+    """Get list of active workers and their log counts."""
+    return JSONResponse({
+        "workers": sorted(pipeline_state.active_workers),
+        "logs_count": {
+            str(w): len(pipeline_state.worker_logs.get(w, []))
+            for w in pipeline_state.active_workers
+        }
+    })
+
+
+@app.get("/partials/workers", response_class=HTMLResponse)
+async def partial_workers(request: Request):
+    """Partial template for worker status cards."""
+    return templates.TemplateResponse(
+        "partials/workers.html",
+        {
+            "request": request,
+            "workers": sorted(pipeline_state.active_workers),
+            "state": pipeline_state.to_dict(),
+        }
+    )
+
+
+@app.get("/partials/logs/worker/{worker_id}", response_class=HTMLResponse)
+async def partial_worker_logs(request: Request, worker_id: int):
+    """Partial template for a specific worker's logs."""
+    logs = pipeline_state.worker_logs.get(worker_id, [])[-100:]
+    return templates.TemplateResponse(
+        "partials/logs.html",
+        {
+            "request": request,
+            "logs": logs,
+            "worker_filter": worker_id,
         }
     )
 

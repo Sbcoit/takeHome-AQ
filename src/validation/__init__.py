@@ -5,6 +5,8 @@ from .qwen_check import QwenConstraintValidator
 from .crosscheck import CrossCheckValidator
 from .correctness import CorrectnessJudge
 from .answer_verify import AnswerVerifier
+from .final_answer import FinalAnswerValidator
+from .derivation_audit import DerivationAuditor
 
 __all__ = [
     "SchemaValidator",
@@ -12,4 +14,6 @@ __all__ = [
     "CrossCheckValidator",
     "CorrectnessJudge",
     "AnswerVerifier",
+    "FinalAnswerValidator",
+    "DerivationAuditor",
 ]

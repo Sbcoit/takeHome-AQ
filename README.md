@@ -36,6 +36,7 @@ The system ensures quality through a multi-stage validation pipeline that tests 
 │  - Coordinates generation → validation → output                  │
 │  - Checkpointing for crash recovery                             │
 │  - Statistics tracking                                          │
+│  - Retries indefinitely until target count is reached           │
 └─────────────────────────────────────────────────────────────────┘
         │                       │                       │
         ▼                       ▼                       ▼
@@ -46,7 +47,7 @@ The system ensures quality through a multi-stage validation pipeline that tests 
 │ TopicSampler  │     │ SchemaValidator │     │ JSONL Writer   │
 │ QAGenerator   │     │ QwenConstraint  │     │ Checkpoint Mgr │
 │ (Claude Opus) │     │ CrossCheckValid │     │ Statistics     │
-└───────────────┘     │ CorrectnessJudge│     └────────────────┘
+└───────────────┘     │ FinalAnswerValid│     └────────────────┘
                       └─────────────────┘
                                 │
                       ┌─────────────────┐
@@ -66,6 +67,7 @@ The system ensures quality through a multi-stage validation pipeline that tests 
    - `QwenConstraintValidator`: Ensures questions aren't too easy
    - `CrossCheckValidator`: Tests with multiple frontier models
    - `CorrectnessJudge`: Verifies physics correctness
+   - `FinalAnswerValidator`: Two-step blind validation (5x consecutive passes required)
 
 3. **Orchestration** (`src/orchestration/`)
    - `ParallelPipelineRunner`: Coordinates the entire workflow with parallel workers
@@ -123,23 +125,50 @@ Uses LLM-as-judge to verify each question:
 
 **Pass criteria**: Dataset-wide accuracy must exceed 90%.
 
+### 5. Final Answer Validation (Post-Generation Two-Step Blind Check)
+
+After all QA pairs pass the initial validation (Schema → Qwen → Cross-check), they go through a rigorous **Final Answer Validation** phase:
+
+**Two-Step Blind Judgment Process** (repeated 5 times per QA):
+1. **Step 1 - Blind Solve**: Claude Opus sees **ONLY the question** (no answer, no solution) and independently solves the problem from first principles
+2. **Step 2 - Compare**: Claude then compares its blind-derived answer to the provided answer to check equivalence
+
+**Why Blind?**: This eliminates confirmation bias. Claude derives its answer before ever seeing the provided answer, ensuring truly independent verification.
+
+**Pass Criteria**: A QA pair must pass **all 5 consecutive** blind judgments to be accepted.
+
+**On Failure - Full Pipeline Re-validation**:
+If final validation fails:
+1. Extract feedback from the failed judgments (what answer Claude derived, why they don't match)
+2. Regenerate the QA pair with the corrected answer
+3. **Re-run the FULL validation pipeline** (Qwen check → Cross-check → Final 5x validation)
+4. Repeat up to 15 times until the QA passes or is discarded
+
+This ensures that any corrected answer doesn't accidentally become "too easy" or fail other validation stages.
+
 ### How "Correct" Is Scored
 
-Correctness is determined by the judge model using a **generous holistic evaluation**:
+The system uses a **10-point rubric-based grading system**:
 
-1. **Correct Physics**: Did the model identify and apply the correct physical principles?
-2. **Correct Answer**: Did the model arrive at the correct (or equivalent) final answer?
-3. **Sound Reasoning**: Is the mathematical/logical approach valid?
+**Point Allocation**:
+- **Final Answer**: 3 points (correct answer is required but not sufficient)
+- **Key Steps**: 7 points (3-7 key steps, each worth 1-4 points)
 
-**Grading philosophy**:
+**Pass Criteria**:
+- **Qwen (STRICT)**: Must score ≥7/10 AND ≥2/3 on final answer
+- **Cross-check (GENEROUS)**: Must score ≥6/10 AND ≥2/3 on final answer
+
+**Grading philosophy for cross-check (generous)**:
 - Accept equivalent answers (different but mathematically equal forms, reasonable rounding)
 - Accept valid alternative approaches that reach the same answer
 - Focus on whether the physics is RIGHT, not exact string matching
 - Minor calculation errors are acceptable if the method is correct
 
-**Mark as CORRECT if**: The model gets the right answer with valid reasoning, OR uses correct physics with only minor errors.
-
-**Mark as INCORRECT only if**: The physics approach is fundamentally wrong, OR the final answer is significantly wrong (wrong order of magnitude, wrong units).
+**Grading philosophy for Qwen check (strict)**:
+- Do NOT give benefit of the doubt
+- Missing steps = missing points
+- Wrong reasoning with right answer = max 3 points (answer only)
+- Right reasoning with wrong answer = max 7 points
 
 The judge uses low temperature (0.1) for consistent evaluation and outputs structured JSON with detailed explanations.
 
@@ -187,8 +216,14 @@ python -m src.main generate --count 5 --topic quantum_mechanics
 # Generate with mixed topics (each worker gets a different topic)
 python -m src.main generate --count 5 --mix-topics
 
+# Customize individual retry limits (defaults: schema=3, qwen=5, crosscheck=5, final=10)
+python -m src.main generate --count 5 --schema-retries 5 --qwen-retries 8 --crosscheck-retries 8 --final-retries 15
+
+# Set unlimited retries for specific stages (0 = unlimited)
+python -m src.main generate --count 5 --qwen-retries 0 --final-retries 0
+
 # With verbose logging
-python -m src.main generate --count 5 --verbose
+python -m src.main generate --count 2 --verbose
 
 # Show available topics
 python -m src.main topics
@@ -200,7 +235,14 @@ python -m src.main info
 python -m src.main validate output/dataset.jsonl
 ```
 
-**Parallel Execution**: The pipeline spawns N workers (where N = requested QA count) that run concurrently. Each worker independently generates and validates one QA pair. Failed workers are automatically replaced (up to 3x the target count).
+**Parallel Execution**: The pipeline spawns N workers (where N = requested QA count) that run concurrently. Each worker independently generates and validates one QA pair. Failed workers are automatically replaced until the target count is reached.
+
+**Retry Behavior** (granular per-stage limits):
+- **Schema validation**: Up to 3 retries. Configure with `--schema-retries`.
+- **Qwen difficulty check**: Up to 5 retries. Configure with `--qwen-retries`.
+- **Cross-check validation**: Up to 5 retries. Configure with `--crosscheck-retries`.
+- **Final 5x blind validation**: Up to 10 retries. Configure with `--final-retries`.
+- Set any limit to 0 for unlimited retries. All flags can be used together.
 
 ### Running via Web UI
 
@@ -231,15 +273,20 @@ The output is a JSONL file with one JSON object per line:
   "response_answer": "E_n = ℏω(n + 1), where n = n_x + n_y (n_x, n_y = 0,1,2,...). The degeneracy of level n is (n + 1).",
   "response_reasoning": "Starting with the Hamiltonian H = p_x²/2m + p_y²/2m + (1/2)mω²x² + (1/2)mω²y². This separates as H = H_x + H_y where each is a 1D harmonic oscillator. The energy eigenvalues are E = ℏω(n_x + 1/2) + ℏω(n_y + 1/2) = ℏω(n_x + n_y + 1). For the nth level where n = n_x + n_y, the pairs (n_x, n_y) can be (0,n), (1,n-1), ..., (n,0), giving (n+1) states.",
   "rubric": {
-    "total_points": 100,
-    "criteria": [
-      {"criterion": "Physical concepts and approach", "max_points": 25, "description": "Correctly identifies the relevant physics and chooses an appropriate solution method."},
-      {"criterion": "Mathematical formulation", "max_points": 25, "description": "Sets up the correct equations with appropriate approximations where needed."},
-      {"criterion": "Solution execution", "max_points": 25, "description": "Carries out the mathematical derivation correctly."},
-      {"criterion": "Final result", "max_points": 15, "description": "Arrives at the correct answer with proper units."},
-      {"criterion": "Physical insight", "max_points": 10, "description": "Demonstrates understanding of the physics behind the mathematics."}
+    "total_points": 10,
+    "final_answer": {
+      "value": "E_n = ℏω(n + 1), degeneracy = (n + 1)",
+      "points": 3,
+      "tolerance": "equivalent symbolic forms accepted",
+      "common_errors": ["Missing ground state energy", "Wrong degeneracy formula"]
+    },
+    "key_steps": [
+      {"step": "Write the Hamiltonian in separable form H = H_x + H_y", "points": 2},
+      {"step": "Identify each component as 1D harmonic oscillator", "points": 2},
+      {"step": "Sum energy eigenvalues and derive degeneracy", "points": 3}
     ],
-    "passing_threshold": 70
+    "partial_credit_rules": ["Correct method but arithmetic error: deduct 1-2 points"],
+    "automatic_zero": ["Uses completely wrong method for the problem type"]
   },
   "response_images": []
 }
@@ -282,6 +329,31 @@ The output is a JSONL file with one JSON object per line:
 **Rationale**: Long-running generation shouldn't lose all progress on failure.
 **Tradeoff**: Small disk I/O overhead.
 
+### 8. High Retry Count for Rate Limits
+**Decision**: Default 30 retries with exponential backoff (capped at 30s)
+**Rationale**: OpenRouter rate limits can cause transient failures, especially with Qwen. Higher retries ensure 30+ QA batches complete reliably.
+**Tradeoff**: Slower recovery from permanent failures, but much better reliability for large batches.
+
+### 9. Granular Per-Stage Retry Limits
+**Decision**: Separate configurable retry limits for each validation stage (schema=3, qwen=5, crosscheck=5, final=10)
+**Rationale**: Different stages have different failure modes. Schema failures are rare but should fail fast. Qwen difficulty and cross-check answer validation may need more attempts. Final validation may require the most retries since it's the strictest.
+**Tradeoff**: More configuration options, but allows fine-tuned control over generation behavior. Set any limit to 0 for unlimited retries.
+
+### 10. Two-Step Blind Final Validation
+**Decision**: Claude solves the problem blind (without seeing the answer), then compares its solution
+**Rationale**: Eliminates confirmation bias. If Claude sees the answer first, it may unconsciously validate it even if wrong.
+**Tradeoff**: 2x API calls per judgment (solve + compare), but much more rigorous verification.
+
+### 11. Full Pipeline Re-validation After Regeneration
+**Decision**: Regenerated QAs go through the full pipeline again (Qwen → Cross-check → Final 5x)
+**Rationale**: A corrected answer might accidentally become "too easy" or fail other validation stages.
+**Tradeoff**: More API calls, but ensures regenerated QAs meet all quality criteria.
+
+### 12. Configurable Retry Limits with Optional Unlimited Mode
+**Decision**: Each validation stage has its own configurable retry limit, with 0 meaning unlimited
+**Rationale**: Users can balance between guaranteed results (unlimited) and fail-fast behavior (limited retries) per stage.
+**Tradeoff**: Unlimited mode may take longer, but guarantees results. Limited mode is faster but may skip difficult questions.
+
 ## What I'd Do With More Time
 
 1. **Few-Shot Examples**: Include 1-2 examples of questions that passed all validation in the generation prompt to anchor output quality
@@ -302,6 +374,8 @@ The output is a JSONL file with one JSON object per line:
 
 - **Parallel Worker Execution**: Spawns N concurrent workers for N requested QAs, dramatically improving throughput. Each worker runs the full pipeline independently, with automatic replacement of failed workers.
 
+- **Granular Retry Limits**: Each validation stage has its own configurable retry limit (`--schema-retries`, `--qwen-retries`, `--crosscheck-retries`, `--final-retries`). Set to 0 for unlimited retries. Data is written to disk immediately so nothing is lost on failure.
+
 - **Post-Generation 5% Easy Filter**: Easy questions are tracked during parallel generation and filtered at the end to meet the 5% dataset-level threshold.
 
 - **Mixed Topic Mode**: `--mix-topics` flag distributes different physics topics across parallel workers for diverse datasets.
@@ -309,6 +383,20 @@ The output is a JSONL file with one JSON object per line:
 - **Adaptive Difficulty Feedback Loop**: Validation failure reasons are fed back into `regenerate_with_feedback()` to improve subsequent attempts (e.g., "Question was too easy - Qwen solved it 4/5 times")
 
 - **Topic Diversity Tracking**: `TopicSampler` tracks used subtopics and prefers unused ones via `prefer_diverse=True`, with coverage statistics available via `get_coverage_stats()`
+
+- **10-Point Rubric-Based Grading**: Structured grading with 3 points for final answer and 7 points for key steps (3-7 steps). Pass criteria differ for Qwen (strict: ≥7/10) vs cross-check (generous: ≥6/10).
+
+- **Robust Rate Limit Handling**: 30 retries with exponential backoff (capped at 30s) ensures reliable generation of 30+ QA batches despite OpenRouter rate limits.
+
+- **Escalating Difficulty Hints**: When questions are too easy, regeneration includes progressively harder requirements like "require perturbation theory" or "add topological considerations".
+
+- **Two-Step Blind Final Validation**: After cross-check validation, Claude Opus performs a rigorous two-step blind judgment 5 times:
+  1. Blind solve (sees only the question, derives answer independently)
+  2. Compare (checks if blind-derived answer matches provided answer)
+
+  This eliminates confirmation bias and ensures truly independent verification.
+
+- **Full Pipeline Re-validation on Failure**: When final validation fails, the regenerated QA goes through the entire pipeline again (Qwen → Cross-check → Final 5x) to ensure correctness, difficulty, and validity are all maintained.
 
 ## Project Structure
 
@@ -329,7 +417,8 @@ takeHome-AQ/
 │   │   ├── schema.py              # Schema validation
 │   │   ├── qwen_check.py          # Qwen constraint
 │   │   ├── crosscheck.py          # Multi-model check
-│   │   └── correctness.py         # LLM-as-judge
+│   │   ├── correctness.py         # LLM-as-judge
+│   │   └── final_answer.py        # Two-step blind validation
 │   ├── orchestration/
 │   │   └── pipeline.py            # Pipeline runner
 │   └── web/

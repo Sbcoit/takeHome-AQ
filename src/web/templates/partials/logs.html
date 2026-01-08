@@ -1,1 +1,11 @@
-{% if logs %}{% for log in logs %}<div class="log{% if ' ERROR ' in log %} err{% elif ' WARNING ' in log %} warn{% elif 'Worker' in log %} worker{% elif 'passed' in log or 'complete' in log or 'verified' in log %} ok{% endif %}">{{ log }}</div>{% endfor %}{% else %}<div class="log dim">waiting...</div>{% endif %}
+{% if logs %}
+{% for log in logs %}
+<div class="log{% if ' ERROR ' in log %} log-error{% elif ' WARNING ' in log %} log-warning{% elif 'passed' in log or 'complete' in log or 'PASSED' in log %} log-success{% elif 'Qwen' in log or 'qwen' in log or 'easy' in log or 'difficulty' in log %} log-qwen{% elif 'cross-check' in log or 'crosscheck' in log or 'Cross-check' in log %} log-crosscheck{% elif 'validation' in log or 'Validation' in log or 'audit' in log or 'Audit' in log %} log-validation{% elif 'Starting' in log or 'Progress' in log or 'Generating' in log %} log-info{% elif '[Worker' in log %} log-worker{% endif %}">
+{%- if '[Worker' in log -%}
+<span class="log-badge">{{ log.split(']')[0].split('[')[-1] }}</span>
+{%- endif -%}
+{{ log }}</div>
+{% endfor %}
+{% else %}
+<div class="log log-muted">Waiting for logs...</div>
+{% endif %}

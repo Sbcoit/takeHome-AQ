@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -55,10 +56,20 @@ def get_api_key() -> str:
     return api_key
 
 
+def generate_unique_output_path(base_dir: str = "output") -> str:
+    """Generate a unique timestamped output file path."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{base_dir}/dataset_{timestamp}.jsonl"
+
+
 @app.command()
 def generate(
     count: int = typer.Option(50, "--count", "-n", help="Number of QA pairs to generate"),
-    output: str = typer.Option("output/dataset.jsonl", "--output", "-o", help="Output file path"),
+    output: Optional[str] = typer.Option(
+        None,
+        "--output", "-o",
+        help="Output file path. If not specified, creates a unique timestamped file (e.g., output/dataset_20260107_143052.jsonl)"
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable verbose logging"),
     topic: Optional[list[str]] = typer.Option(
         None,
@@ -67,11 +78,25 @@ def generate(
         help="Specific topic(s) to generate questions for (can be used multiple times). "
              "Use 'physics-qa topics' to see available topics."
     ),
-    mix_topics: bool = typer.Option(
-        False,
-        "--mix-topics",
-        help="Distribute different topics across parallel workers. "
-             "By default, all workers use the same topic(s)."
+    schema_retries: Optional[int] = typer.Option(
+        None,
+        "--schema-retries",
+        help="Max retries for schema validation. Default 3, 0 = unlimited."
+    ),
+    qwen_retries: Optional[int] = typer.Option(
+        None,
+        "--qwen-retries",
+        help="Max retries for Qwen difficulty check. Default 5, 0 = unlimited."
+    ),
+    crosscheck_retries: Optional[int] = typer.Option(
+        None,
+        "--crosscheck-retries",
+        help="Max retries for cross-check validation. Default 5, 0 = unlimited."
+    ),
+    final_retries: Optional[int] = typer.Option(
+        None,
+        "--final-retries",
+        help="Max retries for final 5x blind validation. Default 10, 0 = unlimited."
     ),
 ):
     """Generate and validate physics QA pairs using parallel workers."""
@@ -79,16 +104,32 @@ def generate(
 
     api_key = get_api_key()
 
+    # Generate unique timestamped filename if not specified
+    if output is None:
+        output = generate_unique_output_path()
+        console.print(f"[dim]Auto-generated output path: {output}[/dim]\n")
+
     # Format topics for display
     topics_display = ", ".join(topic) if topic else "All topics"
-    mix_display = " (mixed across workers)" if mix_topics else ""
+
+    # Helper to format retry display
+    def format_retries(value: Optional[int], default: int) -> str:
+        effective = value if value is not None else default
+        return "Unlimited" if effective == 0 else str(effective)
+
+    # Format retry limits for display
+    schema_display = format_retries(schema_retries, 3)
+    qwen_display = format_retries(qwen_retries, 5)
+    crosscheck_display = format_retries(crosscheck_retries, 5)
+    final_display = format_retries(final_retries, 10)
 
     console.print(
         Panel.fit(
             f"[bold blue]Physics QA Generator[/bold blue]\n\n"
             f"Target: [green]{count}[/green] QA pairs\n"
-            f"Topics: [yellow]{topics_display}{mix_display}[/yellow]\n"
+            f"Topics: [yellow]{topics_display}[/yellow]\n"
             f"Mode: [magenta]Parallel ({count} workers)[/magenta]\n"
+            f"Retry Limits: [cyan]schema={schema_display}, qwen={qwen_display}, crosscheck={crosscheck_display}, final={final_display}[/cyan]\n"
             f"Output: [cyan]{output}[/cyan]",
             title="Configuration",
         )
@@ -122,7 +163,10 @@ def generate(
                     output_path=output,
                     progress_callback=progress_callback,
                     topics=topic,
-                    mix_topics=mix_topics,
+                    schema_max_retries=schema_retries,
+                    qwen_max_retries=qwen_retries,
+                    crosscheck_max_retries=crosscheck_retries,
+                    final_validation_max_retries=final_retries,
                 )
 
                 return result

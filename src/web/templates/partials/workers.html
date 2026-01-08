@@ -1,0 +1,14 @@
+<div class="workers-header">
+    <span class="workers-title">Workers</span>
+    <span class="workers-count">{{ workers|length }}</span>
+</div>
+<div class="workers-list">
+    {% for wid in workers %}
+    <div class="worker-card" data-worker-id="{{ wid }}">
+        <span class="worker-id">W{{ wid }}</span>
+        <span class="worker-indicator active"></span>
+    </div>
+    {% else %}
+    <div class="workers-empty">No active workers</div>
+    {% endfor %}
+</div>

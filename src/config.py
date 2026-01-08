@@ -10,9 +10,15 @@ class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
     # API Configuration
-    openrouter_api_key: str = Field(..., alias="OPENROUTER_API_KEY")
+    openrouter_api_key: str = Field(default="", alias="OPENROUTER_API_KEY")
     openrouter_base_url: str = Field(
         default="https://openrouter.ai/api/v1", alias="OPENROUTER_BASE_URL"
+    )
+
+    # Anthropic API (for Claude models)
+    anthropic_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")
+    anthropic_base_url: str = Field(
+        default="https://api.anthropic.com/v1", alias="ANTHROPIC_BASE_URL"
     )
 
     # OpenAI API (for models not supported by OpenRouter)
@@ -25,13 +31,30 @@ class Settings(BaseSettings):
     generation_model: str = Field(
         default="anthropic/claude-opus-4", alias="GENERATION_MODEL"
     )
-    judge_model: str = Field(default="anthropic/claude-sonnet-4", alias="JUDGE_MODEL")
+    # Solver model for the 2-step generation process
+    # Uses a DIFFERENT model to avoid shared blind spots when solving problems
+    # If empty, uses generation_model (not recommended for accuracy)
+    solver_model: str = Field(
+        default="anthropic/claude-opus-4", alias="SOLVER_MODEL"
+    )
+    judge_model: str = Field(default="anthropic/claude-opus-4", alias="JUDGE_MODEL")
+    # Use a DIFFERENT model for final validation to avoid circular reasoning
+    # GPT-4o provides independent verification of Claude-generated answers
+    # GPT-4o supports 16K output tokens (vs 4K for gpt-4-turbo)
+    final_validation_model: str = Field(
+        default="openai/gpt-4o", alias="FINAL_VALIDATION_MODEL"
+    )
+    # Model for derivation audit (step-by-step logical verification)
+    # Using GPT-4o for rigorous physics reasoning audit (16K output tokens)
+    audit_model: str = Field(
+        default="openai/gpt-4o", alias="AUDIT_MODEL"
+    )
     qwen_model: str = Field(default="qwen/qwen3-max", alias="QWEN_MODEL")
 
     # Cross-check models - stored as comma-separated string in env
     # Per spec: deepseek-v3.2, o4-mini-2025-04-16, gemini-3-pro, grok-4-0709
     crosscheck_models_str: str = Field(
-        default="deepseek/deepseek-v3-0324,openai/o4-mini-2025-04-16,google/gemini-2.5-pro-preview-05-06,x-ai/grok-4",
+        default="deepseek/deepseek-v3.2,google/gemini-3-pro-preview,x-ai/grok-4,openai/o4-mini-2025-04-16",
         alias="CROSSCHECK_MODELS",
     )
 
@@ -41,15 +64,26 @@ class Settings(BaseSettings):
         return [m.strip() for m in self.crosscheck_models_str.split(",") if m.strip()]
 
     # Rate limiting and retries
-    max_concurrent_requests: int = Field(default=50, alias="MAX_CONCURRENT_REQUESTS")
-    requests_per_minute: int = Field(default=200, alias="REQUESTS_PER_MINUTE")
-    max_retries: int = Field(default=10, alias="MAX_RETRIES")
+    max_concurrent_requests: int = Field(default=20, alias="MAX_CONCURRENT_REQUESTS")
+    requests_per_minute: int = Field(default=100, alias="REQUESTS_PER_MINUTE")
+    max_retries: int = Field(default=30, alias="MAX_RETRIES")
 
     # Validation thresholds
     qwen_max_pass_rate: float = Field(default=0.05, alias="QWEN_MAX_PASS_RATE")
     min_crosscheck_models: int = Field(default=2, alias="MIN_CROSSCHECK_MODELS")
     min_crosscheck_total: int = Field(default=5, alias="MIN_CROSSCHECK_TOTAL")
     correctness_threshold: float = Field(default=0.90, alias="CORRECTNESS_THRESHOLD")
+
+    # Final answer validation (post-generation self-check)
+    final_validation_passes: int = Field(default=5, alias="FINAL_VALIDATION_PASSES")
+
+    # Granular regeneration attempt limits (0 = unlimited)
+    # Phase 1: Initial generation validation
+    schema_max_retries: int = Field(default=3, alias="SCHEMA_MAX_RETRIES")  # Schema validation retries
+    qwen_max_retries: int = Field(default=20, alias="QWEN_MAX_RETRIES")  # Qwen difficulty check retries
+    crosscheck_max_retries: int = Field(default=10, alias="CROSSCHECK_MAX_RETRIES")  # Cross-check validation retries
+    # Phase 2: Final validation
+    final_validation_max_retries: int = Field(default=10, alias="FINAL_VALIDATION_MAX_RETRIES")  # Final 5x blind validation retries
 
     # Generation parameters
     samples_per_qwen_check: int = Field(default=5, alias="SAMPLES_PER_QWEN_CHECK")

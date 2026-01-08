@@ -72,7 +72,7 @@ Equivalent = same value, algebraically equal, or differ only in notation.
                 model=self.solver_model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,  # Low temperature for consistent solving
-                max_tokens=16384,
+                max_tokens=32000,
                 response_format={"type": "json_object"},
             )
 

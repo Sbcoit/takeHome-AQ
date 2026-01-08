@@ -1,57 +1,112 @@
 {% extends "base.html" %}
 
-{% block title %}physics-qa{% endblock %}
+{% block title %}Physics QA Generator{% endblock %}
 
 {% block content %}
-<div class="main">
-    <div class="terminal" id="terminal" hx-get="/partials/logs" hx-trigger="every 500ms" hx-swap="innerHTML">
-        {% include "partials/logs.html" %}
-    </div>
-
-    <div class="panel">
-        <div class="status" hx-get="/partials/status" hx-trigger="every 500ms" hx-swap="innerHTML">
+<div class="app">
+    <header class="header">
+        <div class="header-title">
+            <h1>Synthetic Graduate-Level Physics QA System</h1>
+        </div>
+        <div class="header-status" hx-get="/partials/status" hx-trigger="every 500ms" hx-swap="innerHTML">
             {% include "partials/status.html" %}
         </div>
+    </header>
 
-        <form class="form" hx-post="/api/generate" hx-swap="none">
-            <div class="field">
-                <span class="lbl">count</span>
-                <input type="number" name="count" value="5" min="1" max="500">
+    <div class="main">
+        <aside class="controls">
+            <div class="controls-title">Controls</div>
+            <form class="form" hx-post="/api/generate" hx-swap="none">
+                <div class="field">
+                    <label class="lbl">
+                        QA Pairs to Generate
+                        <span class="tooltip" data-tip="Number of question-answer pairs to create. Each pair goes through full validation.">?</span>
+                    </label>
+                    <input type="number" name="count" value="5" min="1" max="500">
+                </div>
+                <div class="field">
+                    <label class="lbl">
+                        Output File
+                        <span class="tooltip" data-tip="Path where generated QA pairs will be saved in JSONL format.">?</span>
+                    </label>
+                    <input type="text" name="output_path" value="output/dataset.jsonl">
+                </div>
+                <div class="field">
+                    <label class="lbl">
+                        Physics Topic
+                        <span class="tooltip" data-tip="Select a specific physics domain or 'All' to randomly sample from all topics.">?</span>
+                    </label>
+                    <select name="topics">
+                        <option value="">All</option>
+                        {% for topic in topics %}
+                        <option value="{{ topic.value }}">{{ topic.label }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <details class="advanced">
+                    <summary>Advanced Settings</summary>
+                    <div class="advanced-content">
+                        <div class="field">
+                            <label class="lbl">
+                                Format Validation Retries
+                                <span class="tooltip" data-tip="Max attempts to fix JSON schema errors. If generation output doesn't match expected format, retry up to this many times. Default: 3, 0 = unlimited.">?</span>
+                            </label>
+                            <input type="number" name="schema_retries" placeholder="3" min="0">
+                        </div>
+                        <div class="field">
+                            <label class="lbl">
+                                Difficulty Check Retries
+                                <span class="tooltip" data-tip="Max attempts to regenerate if question is too easy. Uses Qwen model to verify graduate-level difficulty. Default: 5, 0 = unlimited.">?</span>
+                            </label>
+                            <input type="number" name="qwen_retries" placeholder="5" min="0">
+                        </div>
+                        <div class="field">
+                            <label class="lbl">
+                                Answer Verification Retries
+                                <span class="tooltip" data-tip="Max attempts to regenerate if crosscheck models disagree on the answer. Multiple models verify correctness. Default: 5, 0 = unlimited.">?</span>
+                            </label>
+                            <input type="number" name="crosscheck_retries" placeholder="5" min="0">
+                        </div>
+                        <div class="field">
+                            <label class="lbl">
+                                Final Audit Retries
+                                <span class="tooltip" data-tip="Max attempts to fix issues found in final GPT-4 derivation audit. Checks reasoning quality and answer accuracy. Default: 10, 0 = unlimited.">?</span>
+                            </label>
+                            <input type="number" name="final_retries" placeholder="10" min="0">
+                        </div>
+                    </div>
+                </details>
+
+                <div class="btns">
+                    <button type="submit" class="btn btn-primary" id="btn-run">Generate</button>
+                    <button type="button" class="btn btn-danger" id="btn-stop" hx-post="/api/stop" hx-swap="none" disabled>Stop</button>
+                </div>
+            </form>
+        </aside>
+
+        <section class="logs">
+            <div class="logs-header">
+                <span class="logs-title">System Logs</span>
             </div>
-            <div class="field">
-                <span class="lbl">output</span>
-                <input type="text" name="output_path" value="output/dataset.jsonl">
+            <div class="logs-content" id="logs-content" hx-get="/partials/logs" hx-trigger="every 500ms" hx-swap="innerHTML">
+                {% include "partials/logs.html" %}
             </div>
-            <div class="field">
-                <span class="lbl">topic</span>
-                <select name="topics">
-                    <option value="">all</option>
-                    {% for topic in topics %}
-                    <option value="{{ topic.value }}">{{ topic.label }}</option>
-                    {% endfor %}
-                </select>
-            </div>
-            <div class="field check">
-                <input type="checkbox" name="mix_topics" value="true" id="mix">
-                <label for="mix">mix topics</label>
-            </div>
-            <div class="btns">
-                <button type="submit" class="run" id="btn-run">generate</button>
-                <button type="button" class="stop" id="btn-stop" hx-post="/api/stop" hx-swap="none" disabled>stop</button>
-            </div>
-        </form>
+        </section>
     </div>
 </div>
+{% endblock %}
 
+{% block scripts %}
 <script>
 document.body.addEventListener('htmx:afterSwap', function(e) {
-    if (e.detail.target.id === 'terminal') {
+    if (e.detail.target.id === 'logs-content') {
         e.detail.target.scrollTop = e.detail.target.scrollHeight;
     }
-    if (e.detail.target.classList.contains('status')) {
-        var r = e.detail.target.querySelector('.running');
-        document.getElementById('btn-run').disabled = !!r;
-        document.getElementById('btn-stop').disabled = !r;
+    var status = document.querySelector('.header-status');
+    if (status) {
+        var running = status.querySelector('.running');
+        document.getElementById('btn-run').disabled = !!running;
+        document.getElementById('btn-stop').disabled = !running;
     }
 });
 </script>

@@ -1,4 +1,12 @@
-"""QA generation using LLMs."""
+"""QA generation using LLMs with two-step generation for accuracy.
+
+Two-step generation process:
+1. Generate ONLY the problem (no solution) - focuses on creating good questions
+2. Solve the problem independently - gets a clean derivation without bias
+
+This separation prevents the model from creating problems where the derivation
+doesn't actually support the stated answer.
+"""
 
 import json
 import logging
@@ -13,165 +21,308 @@ logger = logging.getLogger(__name__)
 
 
 class QAGenerator:
-    """Generates physics QA pairs using LLMs."""
+    """Generates physics QA pairs using a two-step process for accuracy.
 
-    SYSTEM_PROMPT = r"""You are an expert physics professor who writes PhD qualifying exam problems. Your problems appear on exams at top research universities and are calibrated for first-year PhD students.
+    Step 1: Generate ONLY the problem statement (no solution)
+    Step 2: Solve the problem independently to get a clean derivation
 
-YOUR SPECIAL SKILL: Writing problems that DISCRIMINATE between careful and careless solvers.
-- Weaker AI models (Qwen, smaller LLMs) should get these WRONG due to common pitfalls
-- Strong AI models (GPT-4, Claude Opus, Gemini Pro) should get them RIGHT with careful reasoning
-- The problems test UNDERSTANDING, not just formula recall
+    This separation prevents the model from creating problems where the stated
+    answer doesn't actually follow from the derivation.
+    """
 
-Your problems feature:
-- TRAPS that catch pattern-matching and formula-plugging
-- Subtle sign conventions where mistakes propagate
-- Boundary conditions that are easy to forget
-- Coupled systems requiring careful algebra
-- Factors of 2, π, or combinatorial factors that careless solvers miss
-- Non-standard setups where textbook formulas don't directly apply
+    # System prompt for problem generation (Step 1)
+    PROBLEM_SYSTEM_PROMPT = r"""You are an expert physics professor who writes PhD qualifying exam problems. Your problems appear on exams at top research universities and are calibrated for first-year PhD students.
 
-Your problems are FAIR:
-- All information needed is explicitly provided
-- The correct answer follows uniquely from careful analysis
-- A human PhD student who thinks carefully CAN solve it
-- The solution is verifiable (correct dimensions, limiting cases work)
+Your problems are:
+- Graduate-level difficulty requiring multi-step derivations
+- Self-contained with ALL information needed to solve
+- Clear and unambiguous - ONE correct answer
+- Solvable through first-principles physics
 
-CRITICAL - LATEX NOTATION REQUIRED:
-All mathematical expressions MUST use LaTeX notation with escaped backslashes for JSON:
-- Variables: "m", "\\omega", "\\hbar", "\\vec{r}"
-- Fractions: "\\frac{a}{b}"
-- Powers: "x^2", "e^{-x}"
-- Roots: "\\sqrt{x}", "\\sqrt[3]{x}"
+IMPORTANT: You are ONLY creating the problem statement. Do NOT solve it.
+
+LATEX NOTATION REQUIRED:
+All mathematical expressions MUST use LaTeX notation:
 - Greek letters: "\\alpha", "\\beta", "\\omega", "\\pi" (NOT Unicode α, β, ω, π)
-- Subscripts: "x_1", "T_0", "E_n" (NOT Unicode ₁, ₀, ₙ)
-- Superscripts: "x^2", "\\hbar^2" (NOT Unicode ²)
-- Operators: "\\partial", "\\nabla", "\\int", "\\sum"
+- Subscripts: "x_1", "T_0", "E_n"
+- Superscripts: "x^2", "\\hbar^2"
+- Fractions: "\\frac{a}{b}"
 
-NEVER use Unicode symbols (α, β, ₁, ², etc.) - ALWAYS use LaTeX (\\alpha, \\beta, _1, ^2, etc.)"""
+NEVER use Unicode symbols - ALWAYS use LaTeX."""
 
-    GENERATION_PROMPT = """Create a PhD qualifying exam question about {topic_context}.
+    # System prompt for solving (Step 2)
+    SOLVER_SYSTEM_PROMPT = r"""You are an expert physics professor solving a graduate-level physics problem.
 
-CRITICAL DIFFICULTY REQUIREMENT:
-This question must be HARD ENOUGH that a mid-tier AI model (like Qwen) will frequently get it WRONG,
-but SOLVABLE ENOUGH that top frontier models (GPT-4, Claude, Gemini) can solve it correctly.
+Your solution must be:
+- RIGOROUS: Show ALL steps, no hand-waving
+- VERIFIED: Check dimensions at each step
+- COMPLETE: Include all intermediate algebra
+- CORRECT: Double-check your final answer
 
-The sweet spot: Questions that PUNISH common mistakes and shortcuts, but reward careful reasoning.
+CRITICAL VERIFICATION CHECKLIST (do this BEFORE finalizing):
+1. Does your final answer have correct units/dimensions?
+2. Does it behave correctly in limiting cases (e.g., as m→0, as T→∞)?
+3. Is the sign correct (check physical intuition)?
+4. Did you include all factors (check for missing 2, π, etc.)?
 
-WHAT TRIPS UP WEAKER MODELS (use these techniques):
-1. **Subtle sign conventions** - Problems where getting the sign wrong changes everything
-2. **Non-obvious coordinate choices** - Where the "obvious" choice leads to harder math
-3. **Coupled equations** - Systems where you can't solve variables independently
-4. **Boundary condition traps** - Where forgetting one condition gives a plausible but wrong answer
-5. **Integration by parts pitfalls** - Where naive integration misses surface terms
-6. **Degeneracy and symmetry** - Where you must carefully count states or handle special cases
-7. **Non-commuting limits** - Where the order of taking limits matters
-8. **Dimensional analysis traps** - Answers that look dimensionally correct but are wrong by factors of 2, \\pi, etc.
+LATEX NOTATION: Use "\\frac{a}{b}", "\\alpha", "\\hbar" etc."""
 
-QUESTION DESIGN PRINCIPLES:
-- The WRONG approach should give a plausible-looking but incorrect answer
-- The RIGHT approach requires recognizing a subtlety that shortcuts miss
-- Multiple derivation paths exist, but careless ones have traps
-- The problem should look standard at first glance but have a twist
+    # Step 1: Problem generation prompt (NO solution)
+    PROBLEM_GENERATION_PROMPT = """Create a PhD qualifying exam question about {topic_context}.
 
-QUESTION TYPE: Pure derivation/calculation problem
-- Solvable through mathematical derivation from first principles
-- NO ambiguous "estimate" or "approximate" questions
-- YES to: "Derive", "Calculate", "Show that", "Find the expression for"
+IMPORTANT: Generate ONLY the problem statement. Do NOT solve it or provide the answer.
 
-QUESTION FORMAT:
-- Single cohesive question (NOT labeled parts (a), (b), (c))
-- Multiple reasoning steps, ONE final answer
+PROBLEM REQUIREMENTS:
+1. Graduate-level difficulty requiring multi-step derivation
+2. Self-contained with ALL information needed to solve
+3. Clear and unambiguous - should have ONE correct symbolic answer
+4. Pure derivation/calculation (use "Derive", "Calculate", "Find the expression for")
+5. Single cohesive question - NO parts (a), (b), (c)
 
-ANSWER FORMAT:
-- SYMBOLIC answer (not decimal): \\frac{{{{4}}}}{{{{3}}}}, 2\\pi, n(n+1)\\hbar^2
-- Use LaTeX: \\frac{{{{a}}}}{{{{b}}}}, \\alpha, \\hbar (NEVER Unicode α, ℏ)
-- Answer must follow UNIQUELY from the setup
+GOOD PROBLEM CHARACTERISTICS:
+- Requires understanding of core physics principles
+- Cannot be solved by plugging into a single formula
+- Has intermediate steps where errors can occur
+- Tests deep understanding, not just memorization
 
-EXAMPLE DIFFICULTY PATTERNS (pick one style):
-
-Style A - Sign/Convention Trap:
-"A charged particle moves in crossed E and B fields..." (where naive velocity addition gives wrong sign)
-
-Style B - Coupled System:
-"Two coupled oscillators with masses m_1, m_2 and springs k_1, k_2, k_{{12}}..." (must diagonalize properly)
-
-Style C - Boundary Condition Trap:
-"A quantum particle in a finite well..." (must match both value AND derivative at boundaries)
-
-Style D - Integration Trap:
-"Calculate the magnetic field of a current loop at an arbitrary point..." (where symmetry arguments fail off-axis)
-
-Style E - Counting/Degeneracy:
-"Find the partition function for N indistinguishable particles..." (where naive counting overcounts)
-
-MANDATORY SELF-VERIFICATION:
-1. Solve the problem yourself step-by-step
-2. Identify where a careless solver would make mistakes
-3. Verify your answer has correct dimensions
-4. Check limiting cases
-5. Confirm the answer is UNIQUE (no ambiguity)
-
-LATEX IN JSON: Use double backslashes: "\\\\frac{{{{a}}}}{{{{b}}}}", "\\\\alpha", "\\\\hbar"
-
-RUBRIC FORMAT (10-point scale):
-- Final answer: 3 points (can't pass by guessing alone)
-- Key steps: 7 points total (conceptual + calculational steps)
-- Pass requires: 7+ points AND correct final answer
+LATEX: Use "\\\\alpha", "\\\\frac{{{{a}}}}{{{{b}}}}", etc. - NEVER Unicode symbols.
 
 Respond with JSON:
 {{{{
-    "query": "Problem statement with all necessary information, using LaTeX for math...",
+    "query": "Complete problem statement with all needed information...",
+    "expected_difficulty": "graduate/advanced_graduate",
+    "key_concepts": ["concept1", "concept2"],
+    "expected_answer_type": "symbolic expression / ratio / energy / etc."
+}}}}"""
+
+    # Step 2: Solve prompt (given a problem, derive the solution)
+    SOLVE_PROMPT = """Solve this physics problem completely and rigorously.
+
+PROBLEM:
+{query}
+
+REQUIREMENTS:
+1. Show ALL steps - no hand-waving or "it can be shown that"
+2. Check dimensions at EACH step
+3. Verify limiting cases where applicable
+4. Double-check algebra and signs
+5. State your final answer clearly
+
+VERIFICATION CHECKLIST (do this BEFORE giving your final answer):
+- [ ] Units/dimensions are correct
+- [ ] Limiting cases make physical sense
+- [ ] Signs are correct (check intuition)
+- [ ] No missing factors of 2, π, etc.
+
+LATEX: Use "\\\\frac{{{{a}}}}{{{{b}}}}", "\\\\alpha", etc.
+
+Respond with JSON:
+{{{{
     "response_answer": "**\\\\frac{{{{symbolic}}}}{{{{answer}}}}**",
-    "response_reasoning": "## Solution\\n\\n### Key Insight\\n[What makes this problem tricky]\\n\\n### Setup\\n[Define variables and equations]\\n\\n### Derivation\\n1. [Step with potential pitfall noted]\\n2. [Careful handling of subtlety]...\\n\\n### Common Mistakes\\n- [What a careless solver would do wrong]\\n\\n### Final Answer\\n**answer**",
+    "response_reasoning": "## Solution\\n\\n### Setup\\n[Define variables]\\n\\n### Derivation\\n1. [Step 1]\\n2. [Step 2]...\\n\\n### Verification\\n- Dimensions: [check]\\n- Limiting case: [check]\\n\\n### Final Answer\\n**answer**",
+    "dimensional_check": "correct/incorrect with explanation",
+    "limiting_cases_checked": ["case1: result makes sense because...", "case2: ..."],
+    "confidence": 0.0-1.0
+}}}}"""
+
+    # Combined prompt for rubric generation (after we have Q and A)
+    RUBRIC_PROMPT = """Generate a grading rubric for this physics problem and solution.
+
+PROBLEM:
+{query}
+
+SOLUTION:
+{response_reasoning}
+
+FINAL ANSWER:
+{response_answer}
+
+Create a 10-point rubric where:
+- Final answer: 3 points
+- Key derivation steps: 7 points total
+
+LATEX: Use "\\\\frac{{{{a}}}}{{{{b}}}}", "\\\\alpha", etc.
+
+Respond with JSON:
+{{{{
     "rubric": {{{{
         "total_points": 10,
         "final_answer": {{{{
-            "value": "\\\\frac{{{{symbolic}}}}{{{{answer}}}}",
+            "value": "{response_answer}",
             "points": 3,
-            "tolerance": "equivalent symbolic forms accepted (e.g., 0.5x = x/2 = \\\\frac{{{{x}}}}{{{{2}}}})",
-            "common_errors": [
-                "Missing factor of 2 from [reason] (1 point partial credit)",
-                "Wrong sign due to [reason] (0 points)"
-            ]
+            "tolerance": "equivalent symbolic forms accepted",
+            "common_errors": ["error1 (partial credit)", "error2 (0 points)"]
         }}}},
         "key_steps": [
-            {{{{"step": "Identify the correct physical principle: [specific law/theorem]", "points": 1}}}},
-            {{{{"step": "Set up the governing equation: [equation]", "points": 2}}}},
-            {{{{"step": "Apply boundary condition / constraint: [specific condition]", "points": 1}}}},
-            {{{{"step": "Perform the key calculation: [integration/algebra/etc]", "points": 2}}}},
-            {{{{"step": "Simplify to final form, checking dimensions", "points": 1}}}}
+            {{{{"step": "step description", "points": 2}}}},
+            {{{{"step": "step description", "points": 2}}}},
+            {{{{"step": "step description", "points": 2}}}},
+            {{{{"step": "step description", "points": 1}}}}
         ],
-        "partial_credit_rules": [
-            "Correct method but arithmetic error: deduct 1-2 points",
-            "Correct setup but wrong algebra: max 5/10",
-            "Only final answer, no work shown: max 3/10"
-        ],
-        "automatic_zero": [
-            "Uses completely wrong method (e.g., classical approach for quantum problem)",
-            "Answer is dimensionally incorrect",
-            "Misidentifies the fundamental physics (e.g., treats as equilibrium when dynamic)"
-        ]
-    }}}},
-    "response_images": []
+        "partial_credit_rules": ["rule1", "rule2"],
+        "automatic_zero": ["condition1", "condition2"]
+    }}}}
 }}}}"""
+
+    # Legacy one-shot prompt (kept for backwards compatibility / fallback)
+    GENERATION_PROMPT = PROBLEM_GENERATION_PROMPT  # Simplified default
 
     def __init__(
         self,
         client: OpenRouterClient,
         model: str,
         judge_model: str = "anthropic/claude-sonnet-4",
+        solver_model: Optional[str] = None,
     ):
         """
-        Initialize the QA generator.
+        Initialize the QA generator with two-step generation.
 
         Args:
             client: OpenRouter API client
-            model: Model identifier for generation
-            judge_model: Model to use for judging (used by validators, not generator)
+            model: Model for problem generation (Step 1)
+            judge_model: Model to use for judging (used by validators)
+            solver_model: Model for solving problems (Step 2). If None, uses same as model.
+                         For best results, use a different model to avoid shared blind spots.
         """
         self.client = client
         self.model = model
         self.judge_model = judge_model
+        # Use a different model for solving if specified, otherwise use same model
+        self.solver_model = solver_model or model
+
+    async def _generate_problem_only(
+        self,
+        topic_context: TopicContext,
+        temperature: float = 0.8,
+    ) -> Dict[str, Any]:
+        """
+        Step 1: Generate ONLY the problem statement (no solution).
+
+        Args:
+            topic_context: The topic context to generate for
+            temperature: Sampling temperature
+
+        Returns:
+            Dict with query and metadata
+        """
+        prompt = self.PROBLEM_GENERATION_PROMPT.format(
+            topic_context=topic_context.to_prompt_string()
+        )
+
+        response = await self.client.chat_completion(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": self.PROBLEM_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=temperature,
+            max_tokens=4096,  # Problems are short
+            response_format={"type": "json_object"},
+        )
+
+        content = response["choices"][0]["message"]["content"]
+        data = extract_json_from_response(content)
+
+        logger.info(f"Generated problem for {topic_context.subtopic}")
+        return data
+
+    async def _solve_problem(
+        self,
+        query: str,
+        temperature: float = 0.3,  # Lower temp for more consistent solving
+    ) -> Dict[str, Any]:
+        """
+        Step 2: Solve the problem independently.
+
+        Args:
+            query: The problem statement to solve
+            temperature: Sampling temperature (lower = more consistent)
+
+        Returns:
+            Dict with answer and reasoning
+        """
+        prompt = self.SOLVE_PROMPT.format(query=query)
+
+        response = await self.client.chat_completion(
+            model=self.solver_model,
+            messages=[
+                {"role": "system", "content": self.SOLVER_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=temperature,
+            max_tokens=16000,  # Solutions can be long
+            response_format={"type": "json_object"},
+        )
+
+        content = response["choices"][0]["message"]["content"]
+        data = extract_json_from_response(content)
+
+        logger.info(f"Solved problem (confidence: {data.get('confidence', 'N/A')})")
+        return data
+
+    async def _generate_rubric(
+        self,
+        query: str,
+        response_answer: str,
+        response_reasoning: str,
+    ) -> Rubric:
+        """
+        Step 3: Generate rubric for grading.
+
+        Args:
+            query: The problem statement
+            response_answer: The final answer
+            response_reasoning: The solution derivation
+
+        Returns:
+            Rubric object
+        """
+        prompt = self.RUBRIC_PROMPT.format(
+            query=query,
+            response_answer=response_answer,
+            response_reasoning=response_reasoning,
+        )
+
+        response = await self.client.chat_completion(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=4096,
+            response_format={"type": "json_object"},
+        )
+
+        content = response["choices"][0]["message"]["content"]
+        data = extract_json_from_response(content)
+        rubric_data = data.get("rubric", {})
+
+        # Parse final_answer
+        final_answer_data = rubric_data.get("final_answer", {})
+        final_answer = FinalAnswer(
+            value=final_answer_data.get("value", response_answer),
+            points=final_answer_data.get("points", 3),
+            tolerance=final_answer_data.get("tolerance", "equivalent symbolic forms accepted"),
+            common_errors=final_answer_data.get("common_errors", []),
+        )
+
+        # Parse key_steps
+        key_steps_data = rubric_data.get("key_steps", [])
+        key_steps = [
+            KeyStep(step=s.get("step", ""), points=s.get("points", 1))
+            for s in key_steps_data
+        ] if key_steps_data else [
+            KeyStep(step="Identify correct physical principle", points=1),
+            KeyStep(step="Set up governing equations", points=2),
+            KeyStep(step="Apply constraints/boundary conditions", points=2),
+            KeyStep(step="Perform calculation and simplify", points=2),
+        ]
+
+        return Rubric(
+            total_points=rubric_data.get("total_points", 10),
+            final_answer=final_answer,
+            key_steps=key_steps,
+            partial_credit_rules=rubric_data.get("partial_credit_rules", []),
+            automatic_zero=rubric_data.get("automatic_zero", []),
+        )
 
     async def generate(
         self,
@@ -180,84 +331,66 @@ Respond with JSON:
         max_retries: int = 3,
     ) -> PhysicsQADataPoint:
         """
-        Generate a single QA pair.
+        Generate a QA pair using two-step process for accuracy.
+
+        Step 1: Generate problem only (no solution)
+        Step 2: Solve problem independently
+        Step 3: Generate rubric
 
         Args:
             topic_context: The topic context to generate for
             temperature: Sampling temperature (higher = more diverse)
-            max_retries: Number of retries for failed JSON parsing
+            max_retries: Number of retries for failed attempts
 
         Returns:
             PhysicsQADataPoint with the generated QA pair
         """
-        prompt = self.GENERATION_PROMPT.format(topic_context=topic_context.to_prompt_string())
-
         for attempt in range(max_retries):
             try:
-                response = await self.client.chat_completion(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": self.SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt},
-                    ],
-                    temperature=temperature,
-                    max_tokens=32768,
-                    response_format={"type": "json_object"},
-                )
+                # Step 1: Generate problem only
+                logger.info(f"Step 1: Generating problem for {topic_context.subtopic}...")
+                problem_data = await self._generate_problem_only(topic_context, temperature)
+                query = problem_data["query"]
 
-                content = response["choices"][0]["message"]["content"]
-                data = extract_json_from_response(content)
+                # Step 2: Solve the problem independently
+                logger.info(f"Step 2: Solving problem independently...")
+                solution_data = await self._solve_problem(query, temperature=0.3)
 
-                # Build the rubric with new point-based format
-                rubric_data = data.get("rubric", {})
+                response_answer = solution_data.get("response_answer", "")
+                response_reasoning = solution_data.get("response_reasoning", "")
 
-                # Parse final_answer
-                final_answer_data = rubric_data.get("final_answer", {})
-                final_answer = FinalAnswer(
-                    value=final_answer_data.get("value", data.get("response_answer", "")),
-                    points=final_answer_data.get("points", 3),
-                    tolerance=final_answer_data.get("tolerance", "equivalent symbolic forms accepted"),
-                    common_errors=final_answer_data.get("common_errors", []),
-                )
+                # Check solver confidence - if low, retry with new problem
+                # Claude should be ~100% confident solving its own problems
+                # Low confidence indicates ambiguous/ill-posed problem or likely wrong answer
+                confidence = solution_data.get("confidence", 0.5)
+                if confidence < 0.95:
+                    logger.warning(
+                        f"Solver confidence too low ({confidence:.2f} < 0.95), regenerating problem..."
+                    )
+                    continue
 
-                # Parse key_steps
-                key_steps_data = rubric_data.get("key_steps", [])
-                key_steps = [
-                    KeyStep(step=s.get("step", ""), points=s.get("points", 1))
-                    for s in key_steps_data
-                ] if key_steps_data else [
-                    KeyStep(step="Identify correct physical principle", points=1),
-                    KeyStep(step="Set up governing equations", points=2),
-                    KeyStep(step="Apply constraints/boundary conditions", points=2),
-                    KeyStep(step="Perform calculation and simplify", points=2),
-                ]
-
-                rubric = Rubric(
-                    total_points=rubric_data.get("total_points", 10),
-                    final_answer=final_answer,
-                    key_steps=key_steps,
-                    partial_credit_rules=rubric_data.get("partial_credit_rules", []),
-                    automatic_zero=rubric_data.get("automatic_zero", []),
-                )
+                # Step 3: Generate rubric
+                logger.info(f"Step 3: Generating rubric...")
+                rubric = await self._generate_rubric(query, response_answer, response_reasoning)
 
                 # Create the data point
                 qa = PhysicsQADataPoint(
-                    query=data["query"],
-                    response_answer=data["response_answer"],
-                    response_reasoning=data["response_reasoning"],
+                    query=query,
+                    response_answer=response_answer,
+                    response_reasoning=response_reasoning,
                     rubric=rubric,
-                    response_images=[],  # Always empty
+                    response_images=[],
                     topic=topic_context.topic,
                     subtopic=topic_context.subtopic,
                 )
 
-                logger.info(f"Generated QA for {topic_context.subtopic}")
+                logger.info(f"Generated QA for {topic_context.subtopic} (2-step process)")
                 return qa
 
             except json.JSONDecodeError as e:
                 logger.warning(f"JSON parse error on attempt {attempt + 1}: {e}")
                 if attempt == max_retries - 1:
-                    raise ValueError(f"Failed to parse generation response after {max_retries} attempts")
+                    raise ValueError(f"Failed to parse response after {max_retries} attempts")
 
             except KeyError as e:
                 logger.warning(f"Missing field in response on attempt {attempt + 1}: {e}")
@@ -307,7 +440,11 @@ Respond with JSON:
         max_retries: int = 3,
     ) -> PhysicsQADataPoint:
         """
-        Regenerate a QA pair with specific feedback.
+        Regenerate a QA pair with specific feedback using two-step process.
+
+        Uses the same two-step approach as generate():
+        Step 1: Regenerate problem based on feedback
+        Step 2: Solve the new/improved problem independently
 
         Args:
             original: The original QA pair to improve
@@ -320,207 +457,216 @@ Respond with JSON:
         """
         # Detect if this is a difficulty-related regeneration
         is_difficulty_feedback = "TOO EASY" in feedback.upper() or "HARDER" in feedback.upper()
+        is_answer_feedback = "INCORRECT" in feedback.upper() or "WRONG" in feedback.upper() or "ANSWER" in feedback.upper()
 
         if is_difficulty_feedback:
-            improvement_prompt = f"""The following physics question was TOO EASY and needs to be made SIGNIFICANTLY HARDER.
+            # Need a harder problem - regenerate problem only, then solve
+            problem_prompt = f"""The following physics question was TOO EASY and needs to be made SIGNIFICANTLY HARDER.
 
 FEEDBACK: {feedback}
 
 ORIGINAL QUESTION (too easy - DO NOT just tweak it):
 {original.query}
 
-CRITICAL: You must generate a COMPLETELY DIFFERENT and MUCH HARDER question on the same topic.
+Generate a COMPLETELY DIFFERENT and MUCH HARDER question on the same topic ({original.subtopic}).
 
-HOW TO MAKE IT GENUINELY HARDER (you MUST do at least 3 of these):
-1. **Combine multiple physics concepts** - e.g., thermodynamics + statistical mechanics, or QM + E&M
-2. **Add non-trivial constraints** - unusual boundary conditions, coupled systems, non-standard geometries
-3. **Require multi-step derivations** - where intermediate results feed into subsequent calculations
-4. **Use perturbation theory or approximation methods** - where students must identify the small parameter
-5. **Include subtle limiting cases** - where naive approaches give wrong answers
-6. **Require coordinate transformations** - non-Cartesian coordinates, rotating frames, etc.
-7. **Add time-dependence or dynamics** - instead of static/equilibrium problems
-8. **Use less common but important physics** - Lagrangian/Hamiltonian methods, Green's functions, etc.
+IMPORTANT: Generate ONLY the problem statement. Do NOT solve it.
 
-WHAT MAKES A QUESTION PhD-LEVEL HARD:
-- Cannot be solved by plugging into a standard formula
-- Requires recognizing which approximations are valid
-- Has multiple steps where errors compound
-- Tests deep understanding, not just memorization
-- Would challenge a first-year physics PhD student
+HOW TO MAKE IT GENUINELY HARDER:
+1. Combine multiple physics concepts
+2. Add non-trivial constraints or unusual boundary conditions
+3. Require multi-step derivations where intermediate results matter
+4. Use perturbation theory or approximation methods
+5. Require coordinate transformations or rotating frames
 
-CRITICAL CONSTRAINTS:
-1. Single cohesive question - NO labeled parts (a), (b), (c)
-2. SYMBOLIC answer with LaTeX: "**\\\\frac{{{{m\\\\omega^2 R^2}}}}{{{{2}}}}**"
-3. Self-contained with all needed information
-4. NO image references
-
-LATEX: Use "\\\\frac{{{{a}}}}{{{{b}}}}", "\\\\alpha", "\\\\hbar" - NEVER Unicode symbols.
+CONSTRAINTS:
+- Single cohesive question (NO parts a, b, c)
+- Self-contained with all needed information
+- Clear and unambiguous
+- LATEX notation: "\\\\alpha", "\\\\frac{{{{a}}}}{{{{b}}}}"
 
 Respond with JSON:
 {{{{
-    "query": "A COMPLETELY NEW, MUCH HARDER question on {original.subtopic}...",
-    "response_answer": "**\\\\frac{{{{symbolic}}}}{{{{answer}}}}**",
-    "response_reasoning": "## Solution\\n\\n### Approach\\n[Why this approach]\\n\\n### Derivation\\n1. [Complex step 1]\\n2. [Complex step 2]...\\n\\n### Final Answer\\n**answer**",
-    "rubric": {{{{
-        "total_points": 10,
-        "final_answer": {{{{
-            "value": "\\\\frac{{{{symbolic}}}}{{{{answer}}}}",
-            "points": 3,
-            "tolerance": "equivalent symbolic forms accepted",
-            "common_errors": ["[common wrong answer] due to [reason] (partial credit)"]
-        }}}},
-        "key_steps": [
-            {{{{"step": "Key conceptual step 1", "points": 1}}}},
-            {{{{"step": "Key calculational step 2", "points": 2}}}},
-            {{{{"step": "Key step 3", "points": 2}}}},
-            {{{{"step": "Key step 4", "points": 2}}}}
-        ],
-        "partial_credit_rules": ["Correct method but error: deduct 1-2 points"],
-        "automatic_zero": ["Wrong method entirely", "Dimensionally incorrect"]
-    }}}},
-    "response_images": []
+    "query": "A COMPLETELY NEW, MUCH HARDER question...",
+    "expected_difficulty": "advanced_graduate",
+    "key_concepts": ["concept1", "concept2"],
+    "expected_answer_type": "symbolic expression"
 }}}}"""
+        elif is_answer_feedback:
+            # Answer was wrong - keep the problem, just re-solve it
+            logger.info("Answer feedback detected - re-solving existing problem...")
+            return await self._regenerate_solution_only(original, feedback, temperature, max_retries)
         else:
-            improvement_prompt = f"""The following physics question needs improvement based on this feedback:
+            # General improvement - regenerate problem based on feedback, then solve
+            problem_prompt = f"""The following physics question needs improvement based on this feedback:
 
 FEEDBACK: {feedback}
 
 ORIGINAL QUESTION:
 {original.query}
 
-ORIGINAL ANSWER:
-{original.response_answer}
+Generate an IMPROVED version of this question that addresses the feedback.
 
-ORIGINAL REASONING:
-{original.response_reasoning}
+IMPORTANT: Generate ONLY the problem statement. Do NOT solve it.
 
-CRITICAL CONSTRAINTS (must follow):
-1. The question must be a SINGLE cohesive question - NO labeled parts like (a), (b), (c)
-2. The answer must be SYMBOLIC with markdown bold using LaTeX: "**\\frac{{{{m\\omega^2 R^2}}}}{{{{2}}}}**", "**\\frac{{{{4}}}}{{{{3}}}}**"
-3. The question must be self-contained with all information needed to solve it
-4. NO references to figures, diagrams, or images
-5. Use MARKDOWN formatting throughout for readability
+CONSTRAINTS:
+- Single cohesive question (NO parts a, b, c)
+- Self-contained with all needed information
+- Clear and unambiguous - ONE correct answer
+- LATEX notation: "\\\\alpha", "\\\\frac{{{{a}}}}{{{{b}}}}"
 
-LATEX NOTATION REQUIRED (CRITICAL):
-- In JSON, use double backslashes: "\\\\frac{{{{a}}}}{{{{b}}}}", "\\\\alpha", "\\\\hbar"
-- Greek letters: "\\\\alpha", "\\\\beta", "\\\\omega", "\\\\pi" - NEVER Unicode (α, β, ω, π)
-- Subscripts: "x_1", "T_0", "E_n" - NEVER Unicode (x₁, T₀, Eₙ)
-- Superscripts: "x^2", "\\\\hbar^2" - NEVER Unicode (x², ℏ²)
-- Fractions: "\\\\frac{{{{numerator}}}}{{{{denominator}}}}"
-
-MANDATORY SELF-VERIFICATION (Do this BEFORE outputting):
-1. Write the COMPLETE governing equation(s) - don't simplify prematurely
-2. Include ALL terms and factors - check standard references if unsure
-3. Verify UNITS/DIMENSIONS of your final answer
-4. Check limiting cases (does the answer make physical sense?)
-5. If the original answer was wrong, derive from scratch - don't just tweak it
-
-COMMON PHYSICS ERRORS TO FIX:
-- Missing concentration/mole fraction factors in transport equations
-- Dropped factors of 2, \\pi, or dimensionless constants
-- Sign errors in gradients (\\nabla T vs dT/dx)
-- Using approximate formulas where exact ones are needed
-
-Please generate an improved version that addresses the feedback while following all constraints above. Respond with JSON only.
-
+Respond with JSON:
 {{{{
-    "query": "Improved question using LaTeX notation for all math...",
-    "response_answer": "**\\\\frac{{{{symbolic}}}}{{{{answer}}}}** (with equivalent forms noted)",
-    "response_reasoning": "## Solution\\n\\n### Given\\n- m: mass\\n- \\\\omega: angular frequency\\n\\n### Approach\\nMethod description.\\n\\n### Derivation\\n1. Step one: **\\\\frac{{{{p^2}}}}{{{{2m}}}}**\\n2. Step two...\\n\\n### Verification\\n- Dimensional analysis: [units]\\n- Limiting case: [check]\\n\\n### Final Answer\\n**\\\\frac{{{{symbolic}}}}{{{{answer}}}}**",
-    "rubric": {{{{
-        "total_points": 10,
-        "final_answer": {{{{
-            "value": "\\\\frac{{{{symbolic}}}}{{{{answer}}}}",
-            "points": 3,
-            "tolerance": "equivalent symbolic forms accepted",
-            "common_errors": ["[common wrong answer] due to [reason] (partial credit)"]
-        }}}},
-        "key_steps": [
-            {{{{"step": "Key conceptual step 1", "points": 1}}}},
-            {{{{"step": "Key calculational step 2", "points": 2}}}},
-            {{{{"step": "Key step 3", "points": 2}}}},
-            {{{{"step": "Key step 4", "points": 2}}}}
-        ],
-        "partial_credit_rules": ["Correct method but error: deduct 1-2 points"],
-        "automatic_zero": ["Wrong method entirely", "Dimensionally incorrect"]
-    }}}},
-    "response_images": []
+    "query": "Improved problem statement...",
+    "expected_difficulty": "graduate",
+    "key_concepts": ["concept1", "concept2"],
+    "expected_answer_type": "symbolic expression"
 }}}}"""
 
+        # Two-step regeneration
         for attempt in range(max_retries):
             try:
+                # Step 1: Regenerate problem
+                logger.info(f"Step 1: Regenerating problem based on feedback...")
                 response = await self.client.chat_completion(
                     model=self.model,
                     messages=[
-                        {"role": "system", "content": self.SYSTEM_PROMPT},
-                        {"role": "user", "content": improvement_prompt},
+                        {"role": "system", "content": self.PROBLEM_SYSTEM_PROMPT},
+                        {"role": "user", "content": problem_prompt},
                     ],
                     temperature=temperature,
-                    max_tokens=32768,
+                    max_tokens=4096,
                     response_format={"type": "json_object"},
                 )
-
                 content = response["choices"][0]["message"]["content"]
-                data = extract_json_from_response(content)
+                problem_data = extract_json_from_response(content)
+                query = problem_data["query"]
 
-                # Build the rubric with new point-based format
-                rubric_data = data.get("rubric", {})
+                # Step 2: Solve the problem independently
+                logger.info(f"Step 2: Solving regenerated problem...")
+                solution_data = await self._solve_problem(query, temperature=0.3)
 
-                # Parse final_answer
-                final_answer_data = rubric_data.get("final_answer", {})
-                final_answer = FinalAnswer(
-                    value=final_answer_data.get("value", data.get("response_answer", "")),
-                    points=final_answer_data.get("points", 3),
-                    tolerance=final_answer_data.get("tolerance", "equivalent symbolic forms accepted"),
-                    common_errors=final_answer_data.get("common_errors", []),
-                )
+                response_answer = solution_data.get("response_answer", "")
+                response_reasoning = solution_data.get("response_reasoning", "")
 
-                # Parse key_steps
-                key_steps_data = rubric_data.get("key_steps", [])
-                key_steps = [
-                    KeyStep(step=s.get("step", ""), points=s.get("points", 1))
-                    for s in key_steps_data
-                ] if key_steps_data else [
-                    KeyStep(step="Identify correct physical principle", points=1),
-                    KeyStep(step="Set up governing equations", points=2),
-                    KeyStep(step="Apply constraints/boundary conditions", points=2),
-                    KeyStep(step="Perform calculation and simplify", points=2),
-                ]
+                # Check solver confidence - require high confidence for regenerated problems too
+                confidence = solution_data.get("confidence", 0.5)
+                if confidence < 0.95:
+                    logger.warning(f"Solver confidence too low ({confidence:.2f} < 0.95), retrying...")
+                    continue
 
-                rubric = Rubric(
-                    total_points=rubric_data.get("total_points", 10),
-                    final_answer=final_answer,
-                    key_steps=key_steps,
-                    partial_credit_rules=rubric_data.get("partial_credit_rules", []),
-                    automatic_zero=rubric_data.get("automatic_zero", []),
-                )
+                # Step 3: Generate rubric
+                logger.info(f"Step 3: Generating rubric...")
+                rubric = await self._generate_rubric(query, response_answer, response_reasoning)
 
                 qa = PhysicsQADataPoint(
-                    query=data["query"],
-                    response_answer=data["response_answer"],
-                    response_reasoning=data["response_reasoning"],
+                    query=query,
+                    response_answer=response_answer,
+                    response_reasoning=response_reasoning,
                     rubric=rubric,
                     response_images=[],
                     topic=original.topic,
                     subtopic=original.subtopic,
                 )
 
-                logger.info(f"Regenerated QA for {original.subtopic}")
+                logger.info(f"Regenerated QA for {original.subtopic} (2-step process)")
                 return qa
-
-            except json.JSONDecodeError as e:
-                logger.warning(f"JSON parse error on regeneration attempt {attempt + 1}: {e}")
-                if attempt == max_retries - 1:
-                    raise ValueError(f"Failed to parse regeneration response after {max_retries} attempts")
-
-            except KeyError as e:
-                logger.warning(f"Missing field in regeneration response on attempt {attempt + 1}: {e}")
-                if attempt == max_retries - 1:
-                    raise ValueError(f"Missing required field: {e}")
 
             except Exception as e:
                 logger.warning(f"Regeneration error on attempt {attempt + 1}: {e}")
                 if attempt == max_retries - 1:
                     raise
 
-        raise RuntimeError("Unexpected end of retry loop")
+        raise RuntimeError(f"Failed to regenerate QA after {max_retries} attempts")
+
+    async def _regenerate_solution_only(
+        self,
+        original: PhysicsQADataPoint,
+        feedback: str,
+        temperature: float = 0.5,
+        max_retries: int = 3,
+    ) -> PhysicsQADataPoint:
+        """
+        Re-solve an existing problem when only the answer was wrong.
+
+        Args:
+            original: The original QA pair (problem is fine, answer is wrong)
+            feedback: Feedback about what was wrong
+            temperature: Sampling temperature
+            max_retries: Number of retries
+
+        Returns:
+            QA pair with same problem but new solution
+        """
+        solve_prompt = f"""Solve this physics problem. The previous solution was INCORRECT.
+
+PROBLEM:
+{original.query}
+
+PREVIOUS (WRONG) ANSWER:
+{original.response_answer}
+
+FEEDBACK ON WHY IT WAS WRONG:
+{feedback}
+
+You must solve this problem from FIRST PRINCIPLES. Do NOT just tweak the old answer.
+
+REQUIREMENTS:
+1. Show ALL steps - no hand-waving
+2. Check dimensions at EACH step
+3. Verify limiting cases
+4. Double-check algebra and signs
+5. State your final answer clearly
+
+LATEX: Use "\\\\frac{{{{a}}}}{{{{b}}}}", "\\\\alpha", etc.
+
+Respond with JSON:
+{{{{
+    "response_answer": "**\\\\frac{{{{symbolic}}}}{{{{answer}}}}**",
+    "response_reasoning": "## Solution\\n\\n### Setup\\n[Define variables]\\n\\n### Derivation\\n[Show ALL steps]\\n\\n### Verification\\n- Dimensions: [check]\\n- Limiting case: [check]\\n\\n### Final Answer\\n**answer**",
+    "dimensional_check": "correct/incorrect with explanation",
+    "limiting_cases_checked": ["case1", "case2"],
+    "confidence": 0.0-1.0
+}}}}"""
+
+        for attempt in range(max_retries):
+            try:
+                response = await self.client.chat_completion(
+                    model=self.solver_model,
+                    messages=[
+                        {"role": "system", "content": self.SOLVER_SYSTEM_PROMPT},
+                        {"role": "user", "content": solve_prompt},
+                    ],
+                    temperature=temperature,
+                    max_tokens=16000,
+                    response_format={"type": "json_object"},
+                )
+
+                content = response["choices"][0]["message"]["content"]
+                solution_data = extract_json_from_response(content)
+
+                response_answer = solution_data.get("response_answer", "")
+                response_reasoning = solution_data.get("response_reasoning", "")
+
+                # Generate new rubric for updated solution
+                rubric = await self._generate_rubric(original.query, response_answer, response_reasoning)
+
+                qa = PhysicsQADataPoint(
+                    query=original.query,  # Keep original problem
+                    response_answer=response_answer,
+                    response_reasoning=response_reasoning,
+                    rubric=rubric,
+                    response_images=[],
+                    topic=original.topic,
+                    subtopic=original.subtopic,
+                )
+
+                logger.info(f"Re-solved problem for {original.subtopic}")
+                return qa
+
+            except Exception as e:
+                logger.warning(f"Re-solve error on attempt {attempt + 1}: {e}")
+                if attempt == max_retries - 1:
+                    raise
+
+        raise RuntimeError(f"Failed to re-solve problem after {max_retries} attempts")
