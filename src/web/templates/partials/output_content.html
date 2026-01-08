@@ -13,10 +13,15 @@
     <!-- Readable View -->
     <div class="output-viewer-list view-readable active">
         {% for qa in items %}
-        <div class="output-qa-item">
+        <div class="output-qa-item" data-index="{{ qa._index }}">
             <div class="output-qa-header">
                 <span class="output-qa-index">#{{ qa._index + 1 }}</span>
                 <span class="output-qa-topic">{{ qa.topic if qa.topic else 'physics' }}</span>
+                <button class="item-fullscreen-btn" onclick="openItemFullscreenFromBtn(this)" title="View in fullscreen">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/>
+                    </svg>
+                </button>
             </div>
             <div class="output-qa-question math-content">
                 {{ qa.query | texify | safe }}
@@ -37,13 +42,34 @@
     <!-- JSON View -->
     <div class="output-viewer-list view-json">
         {% for qa in items %}
-        <div class="output-qa-item json-item">
+        <div class="output-qa-item json-item" data-index="{{ qa._index }}">
             <div class="output-qa-header">
                 <span class="output-qa-index">#{{ qa._index + 1 }}</span>
+                <button class="item-fullscreen-btn" onclick="openItemFullscreenFromBtn(this, true)" title="View in fullscreen">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/>
+                    </svg>
+                </button>
             </div>
             <pre class="json-content">{{ qa | tojson(indent=2) }}</pre>
         </div>
         {% endfor %}
+    </div>
+</div>
+
+<!-- Fullscreen Modal -->
+<div class="fullscreen-modal" id="fullscreen-modal">
+    <div class="fullscreen-backdrop" onclick="closeFullscreen()"></div>
+    <div class="fullscreen-container">
+        <div class="fullscreen-header">
+            <span class="fullscreen-title" id="fullscreen-title"></span>
+            <button class="fullscreen-close" onclick="closeFullscreen()">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M18 6L6 18M6 6l12 12"/>
+                </svg>
+            </button>
+        </div>
+        <div class="fullscreen-content" id="fullscreen-content"></div>
     </div>
 </div>
 <script>
@@ -64,6 +90,47 @@ function toggleOutputView(btn, view) {
         MathJax.typeset();
     }
 }
+
+// Fullscreen modal functions
+function openItemFullscreenFromBtn(btn, isJson) {
+    var item = btn.closest('.output-qa-item');
+    var index = parseInt(item.dataset.index, 10);
+    openItemFullscreen(index, isJson);
+}
+
+function openItemFullscreen(index, isJson) {
+    var viewer = document.querySelector('.output-viewer');
+    var listClass = isJson ? '.view-json' : '.view-readable';
+    var item = viewer.querySelector(listClass + ' .output-qa-item[data-index="' + index + '"]');
+    var title = 'QA Pair #' + (index + 1);
+
+    document.getElementById('fullscreen-title').textContent = title;
+    document.getElementById('fullscreen-content').innerHTML = '<div class="fullscreen-single-item">' + item.innerHTML + '</div>';
+    document.getElementById('fullscreen-modal').classList.add('active');
+    document.body.style.overflow = 'hidden';
+
+    // Open details if in readable view
+    var details = document.querySelector('#fullscreen-content details');
+    if (details) {
+        details.open = true;
+    }
+
+    if (window.MathJax) {
+        MathJax.typeset();
+    }
+}
+
+function closeFullscreen() {
+    document.getElementById('fullscreen-modal').classList.remove('active');
+    document.body.style.overflow = '';
+}
+
+// Close on Escape key
+document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape') {
+        closeFullscreen();
+    }
+});
 
 // Render MathJax for the loaded content
 if (window.MathJax) {

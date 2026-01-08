@@ -1,7 +1,34 @@
 {% if state.is_running %}
 <div class="running">
-    {% if state.phase == 2 %}
-    {# Phase 2: Auditing and validating #}
+    {% if state.phase == "streaming" or state.phase1_count > 0 %}
+    {# Streaming mode: Both phases running concurrently (like CLI) #}
+    <div class="streaming-progress">
+        {# Phase 1: Generation progress #}
+        <div class="phase-indicator gen">
+            <span class="phase-label">Gen:</span>
+            <span class="phase-count">{{ state.phase1_count }}/{{ state.target_count }}</span>
+            <div class="mini-progress">
+                {% set gen_percent = (state.phase1_count / state.target_count * 100) if state.target_count > 0 else 0 %}
+                <div class="mini-progress-fill gen" style="width: {{ gen_percent|int }}%"></div>
+            </div>
+        </div>
+        <span class="phase-separator">|</span>
+        {# Phase 2: Audit progress #}
+        <div class="phase-indicator audit">
+            <span class="phase-label">Audit:</span>
+            {% if state.phase2_validated == 0 %}
+            <span class="phase-count waiting">0/{{ state.target_count }} (waiting...)</span>
+            {% else %}
+            <span class="phase-count">{{ state.phase2_passed }}/{{ state.target_count }}</span>
+            {% endif %}
+            <div class="mini-progress">
+                {% set audit_percent = (state.phase2_passed / state.target_count * 100) if state.target_count > 0 else 0 %}
+                <div class="mini-progress-fill audit" style="width: {{ audit_percent|int }}%"></div>
+            </div>
+        </div>
+    </div>
+    {% elif state.phase == 2 %}
+    {# Phase 2 only (legacy sequential mode) #}
     <div class="status-info">
         <span class="status-dot audit"></span>
         <span class="status-text">Auditing</span>
@@ -12,7 +39,7 @@
     </div>
     <span class="status-passed">{{ state.phase2_passed }} passed</span>
     {% else %}
-    {# Phase 1: Generating #}
+    {# Phase 1 only: Generating #}
     <div class="status-info">
         <span class="status-dot"></span>
         <span class="status-text">Generating</span>

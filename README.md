@@ -247,7 +247,7 @@ python -m src.main generate --count 5 --schema-retries 5 --qwen-retries 8 --cros
 python -m src.main generate --count 5 --qwen-retries 0 --final-retries 0
 
 # With verbose logging
-python -m src.main generate --count 25 --verbose
+python -m src.main generate --count 10 --verbose
 
 # Show available topics
 python -m src.main topics

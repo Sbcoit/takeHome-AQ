@@ -94,8 +94,18 @@
 
         <section class="main-panel">
             <div class="tabs-header">
-                <button class="tab active" data-tab="logs">System Logs</button>
-                <button class="tab" data-tab="output">Output Files</button>
+                <div class="tabs-left">
+                    <button class="tab active" data-tab="logs">System Logs</button>
+                    <button class="tab" data-tab="output">Output Files</button>
+                </div>
+                <div class="tabs-actions" id="logs-actions">
+                    <button class="clear-logs-btn" onclick="clearLogs()" title="Clear logs">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6h14"/>
+                        </svg>
+                        Clear
+                    </button>
+                </div>
             </div>
             <div class="tabs-content">
                 <div class="tab-panel active" id="tab-logs">
@@ -209,7 +219,23 @@ document.querySelectorAll('.tab').forEach(function(tab) {
         // Update tab panels
         document.querySelectorAll('.tab-panel').forEach(function(p) { p.classList.remove('active'); });
         document.getElementById(targetId).classList.add('active');
+
+        // Show/hide logs actions based on active tab
+        var logsActions = document.getElementById('logs-actions');
+        if (logsActions) {
+            logsActions.style.display = this.dataset.tab === 'logs' ? 'flex' : 'none';
+        }
     });
 });
+
+// Clear logs function
+function clearLogs() {
+    fetch('/api/logs/clear', { method: 'POST' })
+        .then(function(response) {
+            if (response.ok) {
+                document.getElementById('logs-content').innerHTML = '';
+            }
+        });
+}
 </script>
 {% endblock %}

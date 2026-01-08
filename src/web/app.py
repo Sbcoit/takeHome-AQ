@@ -606,6 +606,14 @@ async def get_logs(limit: int = 100):
     })
 
 
+@app.post("/api/logs/clear")
+async def clear_logs():
+    """Clear all logs."""
+    pipeline_state.logs = []
+    pipeline_state.worker_logs = {}
+    return JSONResponse({"status": "ok"})
+
+
 @app.get("/api/topics")
 async def get_topics():
     """Get available physics topics."""
