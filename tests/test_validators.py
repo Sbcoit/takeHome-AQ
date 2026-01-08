@@ -21,14 +21,19 @@ class TestSchemaValidator:
             "response_answer": "E_n = hbar * omega * (n + 1/2)",
             "response_reasoning": "We start with the time-independent Schrodinger equation. " * 20,
             "rubric": {
-                "total_points": 100,
-                "criteria": [
-                    {"criterion": "Physical setup", "max_points": 25, "description": "D1"},
-                    {"criterion": "Mathematical formulation", "max_points": 30, "description": "D2"},
-                    {"criterion": "Final answer", "max_points": 25, "description": "D3"},
-                    {"criterion": "Units check", "max_points": 20, "description": "D4"},
+                "final_answer": {
+                    "value": "E_n = hbar * omega * (n + 1/2)",
+                    "points": 3,
+                    "tolerance": "equivalent symbolic forms accepted",
+                    "common_errors": ["Missing 1/2 term", "Wrong coefficient"]
+                },
+                "key_steps": [
+                    {"step": "Set up the Schrodinger equation for harmonic potential", "points": 2},
+                    {"step": "Apply appropriate boundary conditions", "points": 2},
+                    {"step": "Solve for energy eigenvalues", "points": 3}
                 ],
-                "passing_threshold": 60,
+                "partial_credit_rules": ["Correct method but arithmetic error: deduct 1-2 points"],
+                "automatic_zero": ["Uses completely wrong method for the problem type"]
             },
             "response_images": [],
         }
@@ -71,27 +76,15 @@ class TestSchemaValidator:
         is_valid, errors = validator.validate(valid_data)
         assert is_valid is False
 
-    def test_rubric_criteria_sum_mismatch_fails(self, validator, valid_data):
-        """Test that rubric criteria sum mismatch fails."""
-        valid_data["rubric"]["criteria"][0]["max_points"] = 10  # Changes sum
+    def test_missing_rubric_field_fails(self, validator, valid_data):
+        """Test that missing rubric field fails."""
+        del valid_data["rubric"]["final_answer"]
         is_valid, errors = validator.validate(valid_data)
         assert is_valid is False
-        assert any("sum" in e.lower() or "equal" in e.lower() for e in errors)
 
-    def test_too_few_criteria_fails(self, validator, valid_data):
-        """Test that too few criteria fails."""
-        valid_data["rubric"]["total_points"] = 50
-        valid_data["rubric"]["criteria"] = [
-            {"criterion": "A", "max_points": 25, "description": "D1"},
-            {"criterion": "B", "max_points": 25, "description": "D2"},
-        ]
-        is_valid, errors = validator.validate(valid_data)
-        assert is_valid is False
-        assert any("criteria" in e.lower() for e in errors)
-
-    def test_missing_criterion_field_fails(self, validator, valid_data):
-        """Test that missing criterion field fails."""
-        del valid_data["rubric"]["criteria"][0]["criterion"]
+    def test_empty_rubric_field_fails(self, validator, valid_data):
+        """Test that empty rubric field fails."""
+        valid_data["rubric"]["final_answer"]["value"] = ""
         is_valid, errors = validator.validate(valid_data)
         assert is_valid is False
 

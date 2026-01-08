@@ -3,55 +3,14 @@
 import asyncio
 import json
 import logging
-import re
 from typing import Tuple, List, Dict, Any
 
 from ..api.client import OpenRouterClient
 from ..models.schemas import PhysicsQADataPoint, GradingResult
+from ..utils import extract_json_from_response
+from ..prompts import JSON_INSTRUCTION, LATEX_FORMAT_GUIDE, ANSWER_FORMAT_GUIDE
 
 logger = logging.getLogger(__name__)
-
-
-def extract_json_from_response(content: str) -> dict:
-    """
-    Extract JSON from a response that may contain markdown or other text.
-
-    Handles cases like:
-    - Pure JSON: {"key": "value"}
-    - Markdown wrapped: ```json\n{"key": "value"}\n```
-    - Text before/after JSON: "Here is the result: {"key": "value"}"
-    """
-    content = content.strip()
-
-    # Try direct parse first
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError:
-        pass
-
-    # Try to extract from markdown code blocks
-    json_block_pattern = r'```(?:json)?\s*\n?([\s\S]*?)\n?```'
-    matches = re.findall(json_block_pattern, content)
-    for match in matches:
-        try:
-            return json.loads(match.strip())
-        except json.JSONDecodeError:
-            continue
-
-    # Try to find JSON object in the text (find first { and last })
-    first_brace = content.find('{')
-    last_brace = content.rfind('}')
-    if first_brace != -1 and last_brace > first_brace:
-        try:
-            return json.loads(content[first_brace:last_brace + 1])
-        except json.JSONDecodeError:
-            pass
-
-    # Nothing worked, raise error with content preview
-    raise json.JSONDecodeError(
-        f"Could not extract JSON from response: {content[:200]}...",
-        content, 0
-    )
 
 
 class QwenConstraintValidator:
@@ -72,62 +31,72 @@ class QwenConstraintValidator:
     The pipeline decides whether to accept based on current easy question count.
     """
 
-    ANSWER_PROMPT = """You are a physics graduate student taking a qualifying exam.
+    ANSWER_PROMPT = f"""You are a physics graduate student taking a qualifying exam.
 Solve the following problem completely, showing all your work.
 
 PROBLEM:
-{query}
+{{query}}
+{LATEX_FORMAT_GUIDE}
+{ANSWER_FORMAT_GUIDE}
 
-Respond with JSON in this exact format:
-{{
-    "solution": "Your complete step-by-step solution with all mathematical derivations and reasoning",
-    "final_answer": "Your final numerical or symbolic answer with units"
-}}"""
+Use markdown formatting for clarity. Mark your final answer with **bold**.
+{JSON_INSTRUCTION}
 
-    GRADING_PROMPT = """You are an expert physics professor evaluating whether a student demonstrated understanding of a physics problem.
+Expected format:
+{{{{
+    "solution": "## Solution\\n\\n### Approach\\nMethod description.\\n\\n### Derivation\\n1. First step: **equation**\\n2. Second step...\\n\\n### Final Answer\\n**symbolic_answer**",
+    "final_answer": "symbolic answer using LaTeX (e.g., \\\\frac{{m \\\\omega^2 R^2}}{{2}}, \\\\frac{{4}}{{3}}, \\\\frac{{\\\\hbar \\\\omega}}{{2}})"
+}}}}"""
+
+    GRADING_PROMPT = f"""You are a STRICT physics professor grading a student's solution. You must evaluate BOTH the reasoning AND the final answer.
 
 QUESTION:
-{query}
+{{query}}
 
 REFERENCE ANSWER:
-{reference_answer}
+{{reference_answer}}
 
 REFERENCE SOLUTION:
-{reference_reasoning}
+{{reference_reasoning}}
+
+GRADING RUBRIC (10-point scale):
+{{rubric}}
 
 STUDENT'S ANSWER:
-{student_answer}
+{{student_answer}}
 
-Your task is to determine if the student's answer demonstrates correct understanding and arrives at the right answer, even if their approach differs from the reference solution.
+GRADING INSTRUCTIONS:
+1. First, check for AUTOMATIC ZERO conditions (from rubric)
+2. Grade the FINAL ANSWER (3 points max):
+   - Exactly correct or equivalent form: 3 points
+   - Close but missing a factor (2, pi, etc.): 1 point
+   - Wrong: 0 points
+3. Grade each KEY STEP (7 points total):
+   - Award points only if the step is clearly demonstrated
+   - Partial credit allowed within each step
+4. Calculate TOTAL SCORE out of 10
 
-EVALUATION CRITERIA:
-1. **Correct Physics**: Did the student identify and apply the correct physical principles?
-2. **Correct Answer**: Did the student arrive at the correct (or equivalent) final answer?
-3. **Sound Reasoning**: Is the mathematical/logical approach valid, even if different from reference?
+PASS CRITERIA (STRICT):
+- Must score >= 7/10 points total
+- Must have correct final answer (at least 2/3 points)
+- Both conditions required to pass
 
-BE GENEROUS in your evaluation:
-- Accept equivalent answers (e.g., different but equivalent forms, reasonable rounding)
-- Accept valid alternative approaches that reach the same answer
-- Focus on whether the physics is RIGHT, not whether it matches the reference exactly
-- Minor calculation errors are acceptable if the method is correct and the answer is close
+BE STRICT - this is for discriminating between models:
+- Do NOT give benefit of the doubt
+- Missing steps = missing points
+- Wrong reasoning with right answer = max 3 points (answer only)
+- Right reasoning with wrong answer = max 7 points
+{JSON_INSTRUCTION}
 
-Mark as PASSED if:
-- The student gets the right answer (or equivalent) with valid reasoning, OR
-- The student uses correct physics and makes only minor errors
-
-Mark as FAILED only if:
-- The physics approach is fundamentally wrong, OR
-- The final answer is significantly wrong (wrong order of magnitude, wrong units, wrong sign for a meaningful quantity)
-
-IMPORTANT: You MUST respond with ONLY a JSON object. Do not include any text before or after the JSON. Do not use markdown formatting. Do not analyze parts separately.
-
-{{
-    "correct_physics": {{"passed": true/false, "explanation": "one sentence"}},
-    "correct_answer": {{"passed": true/false, "explanation": "one sentence"}},
-    "sound_reasoning": {{"passed": true/false, "explanation": "one sentence"}},
+Expected format:
+{{{{
+    "final_answer_score": {{{{"points": 0-3, "explanation": "why this score"}}}},
+    "key_steps_score": {{{{"points": 0-7, "breakdown": "which steps were demonstrated"}}}},
+    "total_score": 0-10,
+    "automatic_zero_triggered": false,
     "passed": true/false,
     "explanation": "One sentence summary"
-}}"""
+}}}}"""
 
     def __init__(
         self,
@@ -152,20 +121,35 @@ IMPORTANT: You MUST respond with ONLY a JSON object. Do not include any text bef
 
     async def _get_qwen_answer(self, qa: PhysicsQADataPoint) -> str:
         """Have Qwen attempt the question."""
-        prompt = self.ANSWER_PROMPT.format(query=qa.query)
+        prompt = self.ANSWER_PROMPT.replace("{{query}}", qa.query)
 
         try:
             response = await self.client.chat_completion(
                 model=self.qwen_model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.7,
-                max_tokens=65536,
+                max_tokens=8192,
                 reasoning=True,  # Enable thinking mode
                 response_format={"type": "json_object"},
             )
-            return response["choices"][0]["message"]["content"]
+            # Handle different response structures
+            message = response["choices"][0]["message"]
+            content = message.get("content", "")
+
+            # Some models return content as a list or other structure
+            if isinstance(content, list):
+                # Extract text from content array
+                content = " ".join(
+                    item.get("text", str(item)) if isinstance(item, dict) else str(item)
+                    for item in content
+                )
+            elif not isinstance(content, str):
+                content = str(content)
+
+            return content if content else "ERROR: Empty response"
         except Exception as e:
-            logger.error(f"Failed to get Qwen answer: {e}")
+            import traceback
+            logger.error(f"Failed to get Qwen answer: {type(e).__name__}: {e}\n{traceback.format_exc()}")
             return f"ERROR: {e}"
 
     async def _grade_answer(
@@ -176,12 +160,12 @@ IMPORTANT: You MUST respond with ONLY a JSON object. Do not include any text bef
         """Grade a student answer against the rubric."""
         rubric_text = json.dumps(qa.rubric.model_dump(), indent=2)
 
-        prompt = self.GRADING_PROMPT.format(
-            query=qa.query,
-            reference_answer=qa.response_answer,
-            reference_reasoning=qa.response_reasoning,
-            student_answer=student_answer,
-            rubric=rubric_text,
+        prompt = (self.GRADING_PROMPT
+            .replace("{{query}}", qa.query)
+            .replace("{{reference_answer}}", qa.response_answer)
+            .replace("{{reference_reasoning}}", qa.response_reasoning)
+            .replace("{{student_answer}}", student_answer)
+            .replace("{{rubric}}", rubric_text)
         )
 
         max_judge_retries = 3
@@ -197,7 +181,28 @@ IMPORTANT: You MUST respond with ONLY a JSON object. Do not include any text bef
                     response_format={"type": "json_object"},
                 )
 
-                content = response["choices"][0]["message"]["content"]
+                # Debug: log the full response structure
+                logger.debug(f"Judge response structure: {type(response)}, keys: {response.keys() if isinstance(response, dict) else 'N/A'}")
+
+                choices = response.get("choices", [])
+                if not choices:
+                    logger.warning(f"No choices in judge response: {response}")
+                    last_error = "No choices in response"
+                    await asyncio.sleep(1)
+                    continue
+
+                message = choices[0].get("message", {})
+                content = message.get("content", "")
+
+                # Handle content that might be a list (some models return this)
+                if isinstance(content, list):
+                    content = " ".join(
+                        item.get("text", str(item)) if isinstance(item, dict) else str(item)
+                        for item in content
+                    )
+                elif not isinstance(content, str):
+                    logger.warning(f"Unexpected content type: {type(content)}, value: {content}")
+                    content = str(content) if content else ""
 
                 # Handle empty responses - retry
                 if not content or not content.strip():
@@ -206,35 +211,54 @@ IMPORTANT: You MUST respond with ONLY a JSON object. Do not include any text bef
                     await asyncio.sleep(1)
                     continue
 
+                logger.debug(f"Attempting to parse JSON from content (first 500 chars): {content[:500]}")
                 data = extract_json_from_response(content)
+                logger.debug(f"Parsed data type: {type(data)}, keys: {data.keys() if isinstance(data, dict) else 'N/A'}")
 
-                # Parse the simplified grading format
+                # Parse the point-based grading format
                 passed = data.get("passed", False)
                 explanation = data.get("explanation", "")
 
-                # Extract individual criteria results for logging
-                correct_physics = data.get("correct_physics", {}).get("passed", False)
-                correct_answer = data.get("correct_answer", {}).get("passed", False)
-                sound_reasoning = data.get("sound_reasoning", {}).get("passed", False)
+                # Extract point-based scores
+                final_answer_data = data.get("final_answer_score", {})
+                final_answer_points = final_answer_data.get("points", 0) if isinstance(final_answer_data, dict) else 0
 
-                # Count how many criteria passed for compatibility with existing code
-                criteria_passed = sum([correct_physics, correct_answer, sound_reasoning])
+                key_steps_data = data.get("key_steps_score", {})
+                key_steps_points = key_steps_data.get("points", 0) if isinstance(key_steps_data, dict) else 0
+
+                total_score = data.get("total_score", final_answer_points + key_steps_points)
+                automatic_zero = data.get("automatic_zero_triggered", False)
+
+                # If automatic zero was triggered, override the score
+                if automatic_zero:
+                    total_score = 0
+                    passed = False
+
+                # Determine pass: needs >= 7/10 AND >= 2/3 on final answer
+                # (The judge should already compute this, but we double-check)
+                computed_passed = (total_score >= 7) and (final_answer_points >= 2) and not automatic_zero
+
+                # Use judge's passed value but log discrepancy
+                if passed != computed_passed:
+                    logger.warning(
+                        f"Pass criteria mismatch: judge={passed}, computed={computed_passed} "
+                        f"(score={total_score}/10, answer={final_answer_points}/3)"
+                    )
 
                 logger.debug(
-                    f"Grading: physics={correct_physics}, answer={correct_answer}, "
-                    f"reasoning={sound_reasoning}. Overall passed: {passed}"
+                    f"Grading: answer={final_answer_points}/3, steps={key_steps_points}/7, "
+                    f"total={total_score}/10, auto_zero={automatic_zero}. Passed: {passed}"
                 )
 
                 return GradingResult(
                     criteria_scores={
-                        "correct_physics": 1 if correct_physics else 0,
-                        "correct_answer": 1 if correct_answer else 0,
-                        "sound_reasoning": 1 if sound_reasoning else 0,
+                        "final_answer": final_answer_points,
+                        "key_steps": key_steps_points,
                     },
-                    total_points=criteria_passed,
-                    max_points=3,
-                    criteria_passed=criteria_passed,
-                    total_criteria=3,
+                    total_points=total_score,
+                    max_points=10,
+                    criteria_passed=2 if passed else (1 if final_answer_points >= 2 or key_steps_points >= 5 else 0),
+                    total_criteria=2,
                     passed=passed,
                     explanation=explanation,
                 )
@@ -245,17 +269,18 @@ IMPORTANT: You MUST respond with ONLY a JSON object. Do not include any text bef
                 await asyncio.sleep(1)
                 continue
             except Exception as e:
-                logger.error(f"Failed to grade answer: {e}")
+                import traceback
+                logger.error(f"Failed to grade answer: {type(e).__name__}: {e}\n{traceback.format_exc()}")
                 last_error = str(e)
                 break
 
         logger.error(f"Grading failed after {max_judge_retries} attempts: {last_error}")
         return GradingResult(
-            criteria_scores={},
+            criteria_scores={"final_answer": 0, "key_steps": 0},
             total_points=0,
-            max_points=100,
+            max_points=10,
             criteria_passed=0,
-            total_criteria=5,
+            total_criteria=2,
             passed=False,
             explanation=f"Grading failed: {last_error}",
         )
@@ -266,29 +291,34 @@ IMPORTANT: You MUST respond with ONLY a JSON object. Do not include any text bef
         attempt_idx: int,
     ) -> Tuple[str, GradingResult]:
         """Have Qwen attempt the question and immediately grade it."""
-        # Get Qwen's answer
-        answer = await self._get_qwen_answer(qa)
+        try:
+            # Get Qwen's answer
+            answer = await self._get_qwen_answer(qa)
 
-        # If answer failed, return error result
-        if answer.startswith("ERROR:"):
-            grading = GradingResult(
-                criteria_scores={},
-                total_points=0,
-                max_points=100,
-                criteria_passed=0,
-                total_criteria=5,
-                passed=False,
-                explanation=f"Qwen failed to generate answer: {answer}",
+            # If answer failed, return error result
+            if answer.startswith("ERROR:"):
+                grading = GradingResult(
+                    criteria_scores={"final_answer": 0, "key_steps": 0},
+                    total_points=0,
+                    max_points=10,
+                    criteria_passed=0,
+                    total_criteria=2,
+                    passed=False,
+                    explanation=f"Qwen failed to generate answer: {answer}",
+                )
+            else:
+                # Grade it immediately
+                grading = await self._grade_answer(qa, answer)
+
+            logger.debug(
+                f"Qwen attempt {attempt_idx+1}: {grading.criteria_passed}/{grading.total_criteria} "
+                f"criteria passed ({grading.criteria_pass_rate:.0%})"
             )
-        else:
-            # Grade it immediately
-            grading = await self._grade_answer(qa, answer)
-
-        logger.debug(
-            f"Qwen attempt {attempt_idx+1}: {grading.criteria_passed}/{grading.total_criteria} "
-            f"criteria passed ({grading.criteria_pass_rate:.0%})"
-        )
-        return answer, grading
+            return answer, grading
+        except Exception as e:
+            import traceback
+            logger.error(f"Qwen attempt {attempt_idx+1} exception: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+            raise
 
     async def validate(
         self,

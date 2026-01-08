@@ -16,9 +16,7 @@ class SchemaValidator:
     # Minimum requirements for graduate-level content
     MIN_QUERY_WORDS = 15
     MIN_REASONING_WORDS = 50
-    MIN_ANSWER_LENGTH = 5
-    MIN_RUBRIC_CRITERIA = 3
-    MAX_RUBRIC_CRITERIA = 10
+    MIN_ANSWER_LENGTH = 1  # Physics answers can be single symbols like "π", "0", "∞"
 
     def validate(self, data: Dict[str, Any]) -> Tuple[bool, List[str]]:
         """
@@ -93,59 +91,69 @@ class SchemaValidator:
         return len(errors) == 0, errors
 
     def _validate_rubric(self, rubric: Any) -> List[str]:
-        """Validate the rubric structure."""
+        """
+        Validate the rubric structure.
+
+        Rubric format (10-point scale):
+        {
+            "total_points": 10,
+            "final_answer": {
+                "value": "The correct answer in LaTeX",
+                "points": 3,
+                "tolerance": "equivalent symbolic forms accepted",
+                "common_errors": ["list of common errors"]
+            },
+            "key_steps": [
+                {"step": "Description of key step", "points": 1-4}
+            ],
+            "partial_credit_rules": ["list of rules"],
+            "automatic_zero": ["conditions for automatic zero"]
+        }
+        """
         errors = []
 
         if not isinstance(rubric, dict):
             return ["rubric must be an object"]
 
-        # Check total_points
-        total_points = rubric.get("total_points")
-        if not isinstance(total_points, int):
-            errors.append("rubric.total_points must be an integer")
-        elif total_points < 10 or total_points > 100:
-            errors.append("rubric.total_points must be between 10 and 100")
-
-        # Check passing_threshold
-        threshold = rubric.get("passing_threshold")
-        if not isinstance(threshold, int):
-            errors.append("rubric.passing_threshold must be an integer")
-        elif total_points and (threshold < 1 or threshold > total_points):
-            errors.append("rubric.passing_threshold must be between 1 and total_points")
-
-        # Check criteria
-        criteria = rubric.get("criteria", [])
-        if not isinstance(criteria, list):
-            errors.append("rubric.criteria must be an array")
-        elif len(criteria) < self.MIN_RUBRIC_CRITERIA:
-            errors.append(f"rubric must have at least {self.MIN_RUBRIC_CRITERIA} criteria")
-        elif len(criteria) > self.MAX_RUBRIC_CRITERIA:
-            errors.append(f"rubric must have at most {self.MAX_RUBRIC_CRITERIA} criteria")
+        # Validate final_answer
+        final_answer = rubric.get("final_answer")
+        if not final_answer:
+            errors.append("rubric.final_answer is required")
+        elif not isinstance(final_answer, dict):
+            errors.append("rubric.final_answer must be an object")
         else:
-            # Validate each criterion
-            points_sum = 0
-            for i, criterion in enumerate(criteria):
-                if not isinstance(criterion, dict):
-                    errors.append(f"rubric.criteria[{i}] must be an object")
-                    continue
+            if not final_answer.get("value"):
+                errors.append("rubric.final_answer.value is required")
+            elif not isinstance(final_answer.get("value"), str):
+                errors.append("rubric.final_answer.value must be a string")
 
-                if not criterion.get("criterion"):
-                    errors.append(f"rubric.criteria[{i}].criterion is required")
-
-                max_pts = criterion.get("max_points")
-                if not isinstance(max_pts, int) or max_pts < 1:
-                    errors.append(f"rubric.criteria[{i}].max_points must be a positive integer")
+        # Validate key_steps
+        key_steps = rubric.get("key_steps")
+        if not key_steps:
+            errors.append("rubric.key_steps is required")
+        elif not isinstance(key_steps, list):
+            errors.append("rubric.key_steps must be an array")
+        elif len(key_steps) < 3:
+            errors.append("rubric.key_steps must have at least 3 steps")
+        elif len(key_steps) > 7:
+            errors.append("rubric.key_steps must have at most 7 steps")
+        else:
+            total_points = 0
+            for i, step in enumerate(key_steps):
+                if not isinstance(step, dict):
+                    errors.append(f"rubric.key_steps[{i}] must be an object")
                 else:
-                    points_sum += max_pts
-
-                if not criterion.get("description"):
-                    errors.append(f"rubric.criteria[{i}].description is required")
-
-            # Check points sum
-            if isinstance(total_points, int) and points_sum != total_points:
-                errors.append(
-                    f"Sum of criteria max_points ({points_sum}) must equal total_points ({total_points})"
-                )
+                    if not step.get("step"):
+                        errors.append(f"rubric.key_steps[{i}].step is required")
+                    points = step.get("points")
+                    if points is None:
+                        errors.append(f"rubric.key_steps[{i}].points is required")
+                    elif not isinstance(points, int) or points < 1 or points > 4:
+                        errors.append(f"rubric.key_steps[{i}].points must be an integer between 1 and 4")
+                    else:
+                        total_points += points
+            if total_points < 5 or total_points > 9:
+                errors.append(f"rubric.key_steps points must sum to 5-9, got {total_points}")
 
         return errors
 

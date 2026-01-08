@@ -1,105 +1,58 @@
 {% extends "base.html" %}
 
-{% block title %}Dashboard - Physics QA Generator{% endblock %}
+{% block title %}physics-qa{% endblock %}
 
 {% block content %}
-<div class="dashboard">
-    <h1>Physics QA Generator Dashboard</h1>
+<div class="main">
+    <div class="terminal" id="terminal" hx-get="/partials/logs" hx-trigger="every 500ms" hx-swap="innerHTML">
+        {% include "partials/logs.html" %}
+    </div>
 
-    <!-- Status Section -->
-    <section class="status-section"
-             hx-get="/partials/status"
-             hx-trigger="every 2s"
-             hx-swap="innerHTML">
-        {% include "partials/status.html" %}
-    </section>
+    <div class="panel">
+        <div class="status" hx-get="/partials/status" hx-trigger="every 500ms" hx-swap="innerHTML">
+            {% include "partials/status.html" %}
+        </div>
 
-    <!-- Controls -->
-    <section class="controls-section">
-        <h2>Generation Controls</h2>
-        <form id="generate-form" hx-post="/api/generate" hx-swap="none">
-            <div class="form-group">
-                <label for="count">Number of QA Pairs:</label>
-                <input type="number" id="count" name="count" value="50" min="1" max="500">
+        <form class="form" hx-post="/api/generate" hx-swap="none">
+            <div class="field">
+                <span class="lbl">count</span>
+                <input type="number" name="count" value="5" min="1" max="500">
             </div>
-            <div class="form-group">
-                <label for="output_path">Output Path:</label>
-                <input type="text" id="output_path" name="output_path" value="output/dataset.jsonl">
+            <div class="field">
+                <span class="lbl">output</span>
+                <input type="text" name="output_path" value="output/dataset.jsonl">
             </div>
-            <div class="button-group">
-                <button type="submit"
-                        class="btn btn-primary"
-                        {% if state.is_running %}disabled{% endif %}>
-                    Start Generation
-                </button>
-                <button type="button"
-                        class="btn btn-danger"
-                        hx-post="/api/stop"
-                        hx-swap="none"
-                        {% if not state.is_running %}disabled{% endif %}>
-                    Stop
-                </button>
+            <div class="field">
+                <span class="lbl">topic</span>
+                <select name="topics">
+                    <option value="">all</option>
+                    {% for topic in topics %}
+                    <option value="{{ topic.value }}">{{ topic.label }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div class="field check">
+                <input type="checkbox" name="mix_topics" value="true" id="mix">
+                <label for="mix">mix topics</label>
+            </div>
+            <div class="btns">
+                <button type="submit" class="run" id="btn-run">generate</button>
+                <button type="button" class="stop" id="btn-stop" hx-post="/api/stop" hx-swap="none" disabled>stop</button>
             </div>
         </form>
-    </section>
-
-    <!-- Stats Grid -->
-    <section class="stats-grid">
-        <div class="stat-card">
-            <h3>Generated</h3>
-            <span class="stat-value" id="stat-generated">{{ state.stats.total_generated or 0 }}</span>
-        </div>
-        <div class="stat-card">
-            <h3>Valid</h3>
-            <span class="stat-value" id="stat-valid">{{ state.current_count }}</span>
-        </div>
-        <div class="stat-card">
-            <h3>Failed</h3>
-            <span class="stat-value" id="stat-failed">{{ state.stats.failed or 0 }}</span>
-        </div>
-        <div class="stat-card">
-            <h3>Pass Rate</h3>
-            <span class="stat-value" id="stat-rate">{{ state.stats.pass_rate or '0%' }}</span>
-        </div>
-    </section>
-
-    <!-- Two Column Layout -->
-    <div class="two-column">
-        <!-- Logs Section -->
-        <section class="logs-section">
-            <h2>Recent Logs</h2>
-            <div class="logs-container"
-                 hx-get="/partials/logs"
-                 hx-trigger="every 3s"
-                 hx-swap="innerHTML">
-                {% include "partials/logs.html" %}
-            </div>
-        </section>
-
-        <!-- Recent QA Section -->
-        <section class="qa-section">
-            <h2>Recent QA Pairs</h2>
-            <div class="qa-list-container"
-                 hx-get="/partials/qa-list"
-                 hx-trigger="every 5s"
-                 hx-swap="innerHTML">
-                {% include "partials/qa_list.html" %}
-            </div>
-        </section>
     </div>
 </div>
 
 <script>
-    // Handle form submission feedback
-    document.body.addEventListener('htmx:afterRequest', function(evt) {
-        if (evt.detail.pathInfo.requestPath === '/api/generate') {
-            if (evt.detail.successful) {
-                // Refresh status immediately
-                htmx.trigger('#status-section', 'refresh');
-            } else {
-                alert('Failed to start generation: ' + evt.detail.xhr.responseText);
-            }
-        }
-    });
+document.body.addEventListener('htmx:afterSwap', function(e) {
+    if (e.detail.target.id === 'terminal') {
+        e.detail.target.scrollTop = e.detail.target.scrollHeight;
+    }
+    if (e.detail.target.classList.contains('status')) {
+        var r = e.detail.target.querySelector('.running');
+        document.getElementById('btn-run').disabled = !!r;
+        document.getElementById('btn-stop').disabled = !r;
+    }
+});
 </script>
 {% endblock %}

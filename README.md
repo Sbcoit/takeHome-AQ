@@ -32,6 +32,7 @@ The system ensures quality through a multi-stage validation pipeline that tests 
                                 │
 ┌─────────────────────────────────────────────────────────────────┐
 │                    Pipeline Orchestrator                         │
+│  - Parallel or Sequential execution modes                       │
 │  - Coordinates generation → validation → output                  │
 │  - Checkpointing for crash recovery                             │
 │  - Statistics tracking                                          │
@@ -44,7 +45,7 @@ The system ensures quality through a multi-stage validation pipeline that tests 
 ├───────────────┤     ├─────────────────┤     ├────────────────┤
 │ TopicSampler  │     │ SchemaValidator │     │ JSONL Writer   │
 │ QAGenerator   │     │ QwenConstraint  │     │ Checkpoint Mgr │
-│ (Claude)      │     │ CrossCheckValid │     │ Statistics     │
+│ (Claude Opus) │     │ CrossCheckValid │     │ Statistics     │
 └───────────────┘     │ CorrectnessJudge│     └────────────────┘
                       └─────────────────┘
                                 │
@@ -67,8 +68,10 @@ The system ensures quality through a multi-stage validation pipeline that tests 
    - `CorrectnessJudge`: Verifies physics correctness
 
 3. **Orchestration** (`src/orchestration/`)
-   - `PipelineRunner`: Coordinates the entire workflow
+   - `ParallelPipelineRunner`: Coordinates the entire workflow with parallel workers
+   - Spawns N workers (where N = target QA count) that run concurrently
    - Handles checkpointing, statistics, and error recovery
+   - Automatically spawns replacement workers when failures occur
 
 4. **Interfaces**
    - CLI: `src/main.py` (typer-based)
@@ -91,9 +94,13 @@ This is a **dataset-level** constraint:
 - If Qwen passes 4+ out of 5 attempts, the question is marked as "easy"
 - **Dataset constraint**: No more than 5% of questions can be "easy"
 
+**Post-generation filtering**: In parallel mode, all workers complete their validation independently. After all workers finish, the 5% easy question filter is applied:
+- If ≤5% of questions are "easy", all are kept
+- If >5% are "easy", excess easy questions are randomly dropped to meet the threshold
+
 For example, in a 50-question dataset:
 - Up to 2 questions can be "easy" (Qwen 4+/5 passes)
-- Questions beyond the 5% threshold that are "easy" will be rejected and regenerated
+- If 5 easy questions were generated, 3 would be randomly dropped
 
 ### 3. Frontier Model Cross-Check (per-question)
 Per spec, test each question with 4 models × 5 samples = 20 total attempts:
@@ -168,14 +175,20 @@ cp .env.example .env
 ### Running via CLI
 
 ```bash
-# Generate 50 QA pairs (default)
+# Generate 50 QA pairs in parallel (default)
 python -m src.main generate
 
-# Generate custom count
+# Generate custom count with parallel workers
 python -m src.main generate --count 100 --output output/my_dataset.jsonl
 
+# Generate 5 QAs for a specific topic
+python -m src.main generate --count 5 --topic quantum_mechanics
+
+# Generate with mixed topics (each worker gets a different topic)
+python -m src.main generate --count 5 --mix-topics
+
 # With verbose logging
-python -m src.main generate --count 3 --verbose
+python -m src.main generate --count 5 --verbose
 
 # Show available topics
 python -m src.main topics
@@ -186,6 +199,8 @@ python -m src.main info
 # Validate an existing dataset
 python -m src.main validate output/dataset.jsonl
 ```
+
+**Parallel Execution**: The pipeline spawns N workers (where N = requested QA count) that run concurrently. Each worker independently generates and validates one QA pair. Failed workers are automatically replaced (up to 3x the target count).
 
 ### Running via Web UI
 
@@ -247,17 +262,22 @@ The output is a JSONL file with one JSON object per line:
 **Rationale**: Physics correctness requires domain expertise; string matching won't work for equivalent symbolic expressions.
 **Tradeoff**: Additional API cost per question.
 
-### 4. Async Architecture
-**Decision**: Full async with aiohttp
-**Rationale**: Enables parallel API calls for efficiency.
-**Tradeoff**: More complex code, but significantly faster.
+### 4. Parallel Worker Architecture
+**Decision**: Full async with parallel worker pool using asyncio
+**Rationale**: Spawning N workers for N requested QAs maximizes throughput by running all pipelines concurrently.
+**Tradeoff**: Higher peak API usage, but dramatically faster overall execution. Rate limiting is automatically scaled.
 
-### 5. htmx for Web UI
+### 5. Post-Generation Filtering for 5% Easy Threshold
+**Decision**: Accept all valid questions during parallel generation, filter at the end
+**Rationale**: In parallel mode, workers can't coordinate in real-time. Post-filtering ensures we meet the 5% threshold.
+**Tradeoff**: May generate slightly more questions than needed if many are "easy".
+
+### 6. htmx for Web UI
 **Decision**: htmx instead of React/Vue
 **Rationale**: Lightweight, no build step, server-rendered HTML with interactivity.
 **Tradeoff**: Less rich interactivity, but much simpler to maintain.
 
-### 6. Checkpoint System
+### 7. Checkpoint System
 **Decision**: Periodic checkpointing with recovery
 **Rationale**: Long-running generation shouldn't lose all progress on failure.
 **Tradeoff**: Small disk I/O overhead.
@@ -268,19 +288,23 @@ The output is a JSONL file with one JSON object per line:
 
 2. **Human-in-the-Loop**: Add optional human review stage for borderline cases
 
-3. **Batch Processing**: Generate multiple questions in parallel, then validate in batch for better throughput
+3. **HuggingFace Export**: Direct export to HuggingFace datasets format for easy sharing
 
-4. **HuggingFace Export**: Direct export to HuggingFace datasets format for easy sharing
+4. **Difficulty Gradation**: Tag questions with difficulty levels (easy/medium/hard graduate-level)
 
-5. **Difficulty Gradation**: Tag questions with difficulty levels (easy/medium/hard graduate-level)
+5. **Cost Optimization**: Implement caching for repeated model calls, smarter sampling strategies
 
-6. **Cost Optimization**: Implement caching for repeated model calls, smarter sampling strategies
+6. **Better Error Analysis**: Detailed analysis of why questions fail each validation stage
 
-7. **Better Error Analysis**: Detailed analysis of why questions fail each validation stage
-
-8. **Prometheus Metrics**: Add observability for production deployment
+7. **Prometheus Metrics**: Add observability for production deployment
 
 ## Already Implemented
+
+- **Parallel Worker Execution**: Spawns N concurrent workers for N requested QAs, dramatically improving throughput. Each worker runs the full pipeline independently, with automatic replacement of failed workers.
+
+- **Post-Generation 5% Easy Filter**: Easy questions are tracked during parallel generation and filtered at the end to meet the 5% dataset-level threshold.
+
+- **Mixed Topic Mode**: `--mix-topics` flag distributes different physics topics across parallel workers for diverse datasets.
 
 - **Adaptive Difficulty Feedback Loop**: Validation failure reasons are fed back into `regenerate_with_feedback()` to improve subsequent attempts (e.g., "Question was too easy - Qwen solved it 4/5 times")
 

@@ -3,49 +3,14 @@
 import asyncio
 import json
 import logging
-import re
 from typing import Tuple, Dict, Any, List
 
 from ..api.client import OpenRouterClient
 from ..models.schemas import PhysicsQADataPoint
+from ..utils import extract_json_from_response
+from ..prompts import JSON_INSTRUCTION
 
 logger = logging.getLogger(__name__)
-
-
-def extract_json_from_response(content: str) -> dict:
-    """
-    Extract JSON from a response that may contain markdown or other text.
-    """
-    content = content.strip()
-
-    # Try direct parse first
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError:
-        pass
-
-    # Try to extract from markdown code blocks
-    json_block_pattern = r'```(?:json)?\s*\n?([\s\S]*?)\n?```'
-    matches = re.findall(json_block_pattern, content)
-    for match in matches:
-        try:
-            return json.loads(match.strip())
-        except json.JSONDecodeError:
-            continue
-
-    # Try to find JSON object in the text
-    first_brace = content.find('{')
-    last_brace = content.rfind('}')
-    if first_brace != -1 and last_brace > first_brace:
-        try:
-            return json.loads(content[first_brace:last_brace + 1])
-        except json.JSONDecodeError:
-            pass
-
-    raise json.JSONDecodeError(
-        f"Could not extract JSON from response: {content[:200]}...",
-        content, 0
-    )
 
 
 class CorrectnessJudge:
@@ -58,21 +23,21 @@ class CorrectnessJudge:
     - The response_reasoning is correct and supports the answer
     """
 
-    JUDGE_PROMPT = """You are an expert physics professor reviewing exam materials for quality and correctness.
+    JUDGE_PROMPT = f"""You are an expert physics professor reviewing exam materials for quality and correctness.
 
 Evaluate this physics question-answer pair for correctness and quality:
 
 **QUESTION:**
-{query}
+{{query}}
 
 **PROVIDED ANSWER:**
-{response_answer}
+{{response_answer}}
 
 **PROVIDED SOLUTION:**
-{response_reasoning}
+{{response_reasoning}}
 
 **GRADING RUBRIC:**
-{rubric}
+{{rubric}}
 
 Evaluate on these criteria:
 
@@ -99,41 +64,42 @@ Evaluate on these criteria:
    - Is the difficulty appropriate for graduate students?
    - Does it require synthesis of multiple concepts?
 
-Respond with JSON:
-{{
-    "well_posed": {{
+Be rigorous but fair. A question can have minor issues and still be acceptable.
+Mark overall_correct as true only if all core criteria (well_posed, answer_correct, reasoning_correct) are acceptable.
+{JSON_INSTRUCTION}
+
+Expected format:
+{{{{
+    "well_posed": {{{{
         "score": 0-100,
         "issues": ["list any issues"],
         "is_acceptable": true/false
-    }},
-    "answer_correct": {{
+    }}}},
+    "answer_correct": {{{{
         "score": 0-100,
         "issues": ["list any issues"],
         "is_acceptable": true/false
-    }},
-    "reasoning_correct": {{
+    }}}},
+    "reasoning_correct": {{{{
         "score": 0-100,
         "issues": ["list any issues"],
         "is_acceptable": true/false
-    }},
-    "rubric_appropriate": {{
+    }}}},
+    "rubric_appropriate": {{{{
         "score": 0-100,
         "issues": ["list any issues"],
         "is_acceptable": true/false
-    }},
-    "graduate_level": {{
+    }}}},
+    "graduate_level": {{{{
         "score": 0-100,
         "issues": ["list any issues"],
         "is_acceptable": true/false
-    }},
+    }}}},
     "overall_correct": true/false,
     "overall_score": 0-100,
     "confidence": 0.0-1.0,
     "summary": "Brief summary of the evaluation"
-}}
-
-Be rigorous but fair. A question can have minor issues and still be acceptable.
-Mark overall_correct as true only if all core criteria (well_posed, answer_correct, reasoning_correct) are acceptable."""
+}}}}"""
 
     def __init__(
         self,
@@ -165,11 +131,11 @@ Mark overall_correct as true only if all core criteria (well_posed, answer_corre
         """
         rubric_text = json.dumps(qa.rubric.model_dump(), indent=2)
 
-        prompt = self.JUDGE_PROMPT.format(
-            query=qa.query,
-            response_answer=qa.response_answer,
-            response_reasoning=qa.response_reasoning,
-            rubric=rubric_text,
+        prompt = (self.JUDGE_PROMPT
+            .replace("{{query}}", qa.query)
+            .replace("{{response_answer}}", qa.response_answer)
+            .replace("{{response_reasoning}}", qa.response_reasoning)
+            .replace("{{rubric}}", rubric_text)
         )
 
         try:

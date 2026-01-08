@@ -3,55 +3,14 @@
 import asyncio
 import json
 import logging
-import re
 from typing import Tuple, Dict, List, Any
 
 from ..api.client import OpenRouterClient
 from ..models.schemas import PhysicsQADataPoint, ModelTestResult
+from ..utils import extract_json_from_response
+from ..prompts import JSON_INSTRUCTION, LATEX_FORMAT_GUIDE, ANSWER_FORMAT_GUIDE
 
 logger = logging.getLogger(__name__)
-
-
-def extract_json_from_response(content: str) -> dict:
-    """
-    Extract JSON from a response that may contain markdown or other text.
-
-    Handles cases like:
-    - Pure JSON: {"key": "value"}
-    - Markdown wrapped: ```json\n{"key": "value"}\n```
-    - Text before/after JSON: "Here is the result: {"key": "value"}"
-    """
-    content = content.strip()
-
-    # Try direct parse first
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError:
-        pass
-
-    # Try to extract from markdown code blocks
-    json_block_pattern = r'```(?:json)?\s*\n?([\s\S]*?)\n?```'
-    matches = re.findall(json_block_pattern, content)
-    for match in matches:
-        try:
-            return json.loads(match.strip())
-        except json.JSONDecodeError:
-            continue
-
-    # Try to find JSON object in the text (find first { and last })
-    first_brace = content.find('{')
-    last_brace = content.rfind('}')
-    if first_brace != -1 and last_brace > first_brace:
-        try:
-            return json.loads(content[first_brace:last_brace + 1])
-        except json.JSONDecodeError:
-            pass
-
-    # Nothing worked, raise error with content preview
-    raise json.JSONDecodeError(
-        f"Could not extract JSON from response: {content[:200]}...",
-        content, 0
-    )
 
 
 class CrossCheckValidator:
@@ -71,61 +30,71 @@ class CrossCheckValidator:
         "x-ai/grok-4",
     ]
 
-    SOLVE_PROMPT = """Solve this physics problem completely. Show your work and provide your final answer.
+    SOLVE_PROMPT = f"""Solve this physics problem completely. Show your work and provide your final answer.
 
 PROBLEM:
-{query}
+{{query}}
+{LATEX_FORMAT_GUIDE}
+{ANSWER_FORMAT_GUIDE}
 
-Respond with JSON in this exact format:
-{{
-    "solution": "Your complete step-by-step solution with all mathematical derivations",
-    "final_answer": "Your final numerical or symbolic answer with units"
-}}"""
+Use markdown formatting for clarity. Mark your final answer with **bold**.
+{JSON_INSTRUCTION}
 
-    JUDGE_PROMPT = """You are an expert physics professor evaluating whether a student demonstrated understanding of a physics problem.
+Expected format:
+{{{{
+    "solution": "## Solution\\n\\n### Approach\\nMethod description.\\n\\n### Derivation\\n1. First step: **equation**\\n2. Second step...\\n\\n### Final Answer\\n**symbolic_answer**",
+    "final_answer": "symbolic answer using LaTeX (e.g., \\\\frac{{m \\\\omega^2 R^2}}{{2}}, \\\\frac{{4}}{{3}}, \\\\frac{{\\\\hbar \\\\omega}}{{2}})"
+}}}}"""
+
+    JUDGE_PROMPT = f"""You are an expert physics professor grading a student's solution. You must evaluate BOTH the reasoning AND the final answer.
 
 QUESTION:
-{query}
+{{query}}
 
 REFERENCE ANSWER:
-{reference_answer}
+{{reference_answer}}
 
 REFERENCE SOLUTION:
-{reference_reasoning}
+{{reference_reasoning}}
+
+GRADING RUBRIC (10-point scale):
+{{rubric}}
 
 STUDENT'S ANSWER:
-{student_answer}
+{{student_answer}}
 
-Your task is to determine if the student's answer demonstrates correct understanding and arrives at the right answer, even if their approach differs from the reference solution.
+GRADING INSTRUCTIONS:
+1. First, check for AUTOMATIC ZERO conditions (from rubric)
+2. Grade the FINAL ANSWER (3 points max):
+   - Exactly correct or equivalent form: 3 points
+   - Close but missing a factor (2, pi, etc.): 1 point
+   - Wrong: 0 points
+3. Grade each KEY STEP (7 points total):
+   - Award points only if the step is clearly demonstrated
+   - Partial credit allowed within each step
+4. Calculate TOTAL SCORE out of 10
 
-EVALUATION CRITERIA:
-1. **Correct Physics**: Did the student identify and apply the correct physical principles?
-2. **Correct Answer**: Did the student arrive at the correct (or equivalent) final answer?
-3. **Sound Reasoning**: Is the mathematical/logical approach valid, even if different from reference?
+PASS CRITERIA (GENEROUS for frontier models):
+- Must score >= 6/10 points total
+- Must have correct final answer (at least 2/3 points)
+- Both conditions required to pass
 
 BE GENEROUS in your evaluation:
 - Accept equivalent answers (e.g., different but equivalent forms, reasonable rounding)
 - Accept valid alternative approaches that reach the same answer
+- Minor calculation errors are acceptable if the method is correct and answer is close
 - Focus on whether the physics is RIGHT, not whether it matches the reference exactly
-- Minor calculation errors are acceptable if the method is correct and the answer is close
+{JSON_INSTRUCTION}
 
-Mark as CORRECT if:
-- The student gets the right answer (or equivalent) with valid reasoning, OR
-- The student uses correct physics and makes only minor errors
-
-Mark as INCORRECT only if:
-- The physics approach is fundamentally wrong, OR
-- The final answer is significantly wrong (wrong order of magnitude, wrong units, wrong sign for a meaningful quantity)
-
-IMPORTANT: You MUST respond with ONLY a JSON object. Do not include any text before or after the JSON. Do not use markdown formatting. Do not analyze parts separately.
-
-{{
-    "correct_physics": {{"passed": true/false, "explanation": "one sentence"}},
-    "correct_answer": {{"passed": true/false, "explanation": "one sentence"}},
-    "sound_reasoning": {{"passed": true/false, "explanation": "one sentence"}},
+Expected format:
+{{{{
+    "final_answer_score": {{{{"points": 0-3, "explanation": "why this score"}}}},
+    "key_steps_score": {{{{"points": 0-7, "breakdown": "which steps were demonstrated"}}}},
+    "total_score": 0-10,
+    "automatic_zero_triggered": false,
     "is_correct": true/false,
     "explanation": "One sentence summary"
-}}"""
+}}}}"""
 
     def __init__(
         self,
@@ -153,19 +122,34 @@ IMPORTANT: You MUST respond with ONLY a JSON object. Do not include any text bef
 
     async def _get_model_answer(self, model: str, qa: PhysicsQADataPoint) -> str:
         """Get an answer from a specific model."""
-        prompt = self.SOLVE_PROMPT.format(query=qa.query)
+        prompt = self.SOLVE_PROMPT.replace("{{query}}", qa.query)
 
         try:
             response = await self.client.chat_completion(
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.7,
-                max_tokens=65536,
+                max_tokens=8192,
+                reasoning=True,  # Enable thinking/reasoning mode for better problem solving
                 response_format={"type": "json_object"},
             )
-            return response["choices"][0]["message"]["content"]
+            # Handle different response structures
+            message = response["choices"][0]["message"]
+            content = message.get("content", "")
+
+            # Some models return content as a list or other structure
+            if isinstance(content, list):
+                content = " ".join(
+                    item.get("text", str(item)) if isinstance(item, dict) else str(item)
+                    for item in content
+                )
+            elif not isinstance(content, str):
+                content = str(content)
+
+            return content if content else "ERROR: Empty response"
         except Exception as e:
-            logger.warning(f"Failed to get answer from {model}: {e}")
+            import traceback
+            logger.warning(f"Failed to get answer from {model}: {type(e).__name__}: {e}\n{traceback.format_exc()}")
             return f"ERROR: {e}"
 
     async def _judge_correctness(
@@ -180,12 +164,12 @@ IMPORTANT: You MUST respond with ONLY a JSON object. Do not include any text bef
         # Include rubric in the prompt
         rubric_text = json.dumps(qa.rubric.model_dump(), indent=2)
 
-        prompt = self.JUDGE_PROMPT.format(
-            query=qa.query,
-            reference_answer=qa.response_answer,
-            reference_reasoning=qa.response_reasoning,
-            student_answer=student_answer,
-            rubric=rubric_text,
+        prompt = (self.JUDGE_PROMPT
+            .replace("{{query}}", qa.query)
+            .replace("{{reference_answer}}", qa.response_answer)
+            .replace("{{reference_reasoning}}", qa.response_reasoning)
+            .replace("{{student_answer}}", student_answer)
+            .replace("{{rubric}}", rubric_text)
         )
 
         max_judge_retries = 3
@@ -201,7 +185,28 @@ IMPORTANT: You MUST respond with ONLY a JSON object. Do not include any text bef
                     response_format={"type": "json_object"},
                 )
 
-                content = response["choices"][0]["message"]["content"]
+                # Debug: log the full response structure
+                logger.debug(f"Judge response structure: {type(response)}, keys: {response.keys() if isinstance(response, dict) else 'N/A'}")
+
+                choices = response.get("choices", [])
+                if not choices:
+                    logger.warning(f"No choices in judge response: {response}")
+                    last_error = "No choices in response"
+                    await asyncio.sleep(1)
+                    continue
+
+                message = choices[0].get("message", {})
+                content = message.get("content", "")
+
+                # Handle content that might be a list (some models return this)
+                if isinstance(content, list):
+                    content = " ".join(
+                        item.get("text", str(item)) if isinstance(item, dict) else str(item)
+                        for item in content
+                    )
+                elif not isinstance(content, str):
+                    logger.warning(f"Unexpected content type: {type(content)}, value: {content}")
+                    content = str(content) if content else ""
 
                 # Handle empty responses - retry
                 if not content or not content.strip():
@@ -210,20 +215,40 @@ IMPORTANT: You MUST respond with ONLY a JSON object. Do not include any text bef
                     await asyncio.sleep(1)
                     continue
 
+                logger.debug(f"Attempting to parse JSON from content (first 500 chars): {content[:500]}")
                 data = extract_json_from_response(content)
+                logger.debug(f"Parsed data type: {type(data)}, keys: {data.keys() if isinstance(data, dict) else 'N/A'}")
 
-                # Parse the simplified grading response
+                # Parse the point-based grading response
                 is_correct = data.get("is_correct", False)
                 explanation = data.get("explanation", "")
 
-                # Log detailed breakdown for debugging
-                correct_physics = data.get("correct_physics", {}).get("passed", False)
-                correct_answer = data.get("correct_answer", {}).get("passed", False)
-                sound_reasoning = data.get("sound_reasoning", {}).get("passed", False)
+                # Extract point-based scores for logging
+                final_answer_data = data.get("final_answer_score", {})
+                final_answer_points = final_answer_data.get("points", 0) if isinstance(final_answer_data, dict) else 0
+
+                key_steps_data = data.get("key_steps_score", {})
+                key_steps_points = key_steps_data.get("points", 0) if isinstance(key_steps_data, dict) else 0
+
+                total_score = data.get("total_score", final_answer_points + key_steps_points)
+                automatic_zero = data.get("automatic_zero_triggered", False)
+
+                # If automatic zero was triggered, override
+                if automatic_zero:
+                    is_correct = False
+
+                # Verify pass criteria (generous: >= 6/10 AND >= 2/3 on answer)
+                computed_correct = (total_score >= 6) and (final_answer_points >= 2) and not automatic_zero
+
+                if is_correct != computed_correct:
+                    logger.debug(
+                        f"Correctness mismatch: judge={is_correct}, computed={computed_correct} "
+                        f"(score={total_score}/10, answer={final_answer_points}/3)"
+                    )
 
                 logger.debug(
-                    f"Grading: physics={correct_physics}, answer={correct_answer}, "
-                    f"reasoning={sound_reasoning}. Overall: {is_correct}"
+                    f"Grading: answer={final_answer_points}/3, steps={key_steps_points}/7, "
+                    f"total={total_score}/10, auto_zero={automatic_zero}. Correct: {is_correct}"
                 )
 
                 return is_correct, explanation
@@ -234,7 +259,8 @@ IMPORTANT: You MUST respond with ONLY a JSON object. Do not include any text bef
                 await asyncio.sleep(1)
                 continue
             except Exception as e:
-                logger.error(f"Failed to judge correctness: {e}")
+                import traceback
+                logger.error(f"Failed to judge correctness: {type(e).__name__}: {e}\n{traceback.format_exc()}")
                 last_error = str(e)
                 break
 
@@ -248,10 +274,15 @@ IMPORTANT: You MUST respond with ONLY a JSON object. Do not include any text bef
         sample_idx: int,
     ) -> Tuple[str, bool, str]:
         """Test a single sample: get answer then immediately judge it."""
-        answer = await self._get_model_answer(model, qa)
-        is_correct, explanation = await self._judge_correctness(qa, answer)
-        logger.debug(f"{model} attempt {sample_idx+1}: {'CORRECT' if is_correct else 'INCORRECT'}")
-        return answer, is_correct, explanation
+        try:
+            answer = await self._get_model_answer(model, qa)
+            is_correct, explanation = await self._judge_correctness(qa, answer)
+            logger.debug(f"{model} attempt {sample_idx+1}: {'CORRECT' if is_correct else 'INCORRECT'}")
+            return answer, is_correct, explanation
+        except Exception as e:
+            import traceback
+            logger.error(f"{model} attempt {sample_idx+1} exception: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+            raise
 
     async def _test_single_model(
         self,

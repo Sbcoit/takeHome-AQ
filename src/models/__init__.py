@@ -3,7 +3,6 @@
 from .schemas import (
     PhysicsQADataPoint,
     Rubric,
-    RubricCriterion,
     ValidationResult,
     GenerationStats,
     PhysicsTopic,
@@ -12,7 +11,6 @@ from .schemas import (
 __all__ = [
     "PhysicsQADataPoint",
     "Rubric",
-    "RubricCriterion",
     "ValidationResult",
     "GenerationStats",
     "PhysicsTopic",

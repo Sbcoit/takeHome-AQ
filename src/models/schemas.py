@@ -24,37 +24,77 @@ class PhysicsTopic(str, Enum):
     FLUID_MECHANICS = "Fluid Mechanics"
 
 
+class KeyStep(BaseModel):
+    """A key step in the solution with associated points."""
+    step: str = Field(..., description="Description of the key step")
+    points: int = Field(..., ge=1, le=4, description="Points for this step (1-4)")
+
+
+class FinalAnswer(BaseModel):
+    """The final answer with grading details."""
+    value: str = Field(..., description="The correct final answer in LaTeX")
+    points: int = Field(default=3, description="Points for correct final answer")
+    tolerance: str = Field(
+        default="equivalent symbolic forms accepted",
+        description="What variations are acceptable"
+    )
+    common_errors: List[str] = Field(
+        default_factory=list,
+        description="Common wrong answers and their point deductions"
+    )
+
+
 class Rubric(BaseModel):
     """
-    A simple pass/fail grading rubric for physics questions.
+    A comprehensive point-based grading rubric for physics questions.
 
-    Three criteria, all pass/fail:
-    1. Correct Physics - Did the student apply the correct physical principles?
-    2. Correct Answer - Did they arrive at the correct (or equivalent) final answer?
-    3. Sound Reasoning - Is the mathematical/logical approach valid?
+    Total: 10 points
+    - Final answer: 3 points (can't pass by guessing alone)
+    - Key steps: 7 points (conceptual + calculational)
 
-    A response passes if all three criteria are satisfied.
+    Pass threshold: 7/10 points with correct final answer
+    This ensures both correct reasoning AND correct answer are required.
     """
 
-    correct_physics: str = Field(
+    total_points: int = Field(default=10, description="Total points available")
+
+    final_answer: FinalAnswer = Field(
         ...,
-        description="What physical principles/laws must be correctly identified and applied"
-    )
-    correct_answer: str = Field(
-        ...,
-        description="The expected answer (or equivalent forms) that constitutes a correct result"
-    )
-    sound_reasoning: str = Field(
-        ...,
-        description="What mathematical/logical steps are required for valid reasoning"
+        description="The correct final answer with grading details"
     )
 
-    @field_validator("correct_physics", "correct_answer", "sound_reasoning")
+    key_steps: List[KeyStep] = Field(
+        ...,
+        min_length=3,
+        max_length=7,
+        description="Key conceptual and calculational steps (3-7 steps)"
+    )
+
+    partial_credit_rules: List[str] = Field(
+        default_factory=lambda: [
+            "Correct method but arithmetic error: deduct 1-2 points",
+            "Correct setup but wrong algebra: max 5/10",
+            "Only final answer, no work shown: max 3/10"
+        ],
+        description="Rules for partial credit"
+    )
+
+    automatic_zero: List[str] = Field(
+        default_factory=lambda: [
+            "Uses completely wrong method for the problem type",
+            "Answer is dimensionally incorrect"
+        ],
+        description="Conditions that result in automatic zero"
+    )
+
+    @field_validator("key_steps")
     @classmethod
-    def criterion_not_empty(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("Rubric criterion cannot be empty")
-        return v.strip()
+    def validate_key_steps_points(cls, v: List[KeyStep]) -> List[KeyStep]:
+        """Ensure key steps sum to approximately 7 points."""
+        total = sum(step.points for step in v)
+        if total < 5 or total > 9:
+            raise ValueError(f"Key steps should sum to 5-9 points, got {total}")
+        return v
 
 
 class PhysicsQADataPoint(BaseModel):

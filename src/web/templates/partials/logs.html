@@ -1,9 +1,1 @@
-<div class="logs-list">
-    {% if logs %}
-        {% for log in logs | reverse %}
-        <div class="log-entry">{{ log }}</div>
-        {% endfor %}
-    {% else %}
-    <div class="log-entry empty">No logs yet. Start generation to see activity.</div>
-    {% endif %}
-</div>
+{% if logs %}{% for log in logs %}<div class="log{% if ' ERROR ' in log %} err{% elif ' WARNING ' in log %} warn{% elif 'Worker' in log %} worker{% elif 'passed' in log or 'complete' in log or 'verified' in log %} ok{% endif %}">{{ log }}</div>{% endfor %}{% else %}<div class="log dim">waiting...</div>{% endif %}

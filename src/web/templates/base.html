@@ -3,30 +3,15 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{% block title %}Physics QA Generator{% endblock %}</title>
+    <title>{% block title %}physics-qa{% endblock %}</title>
     <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/static/style.css">
-    {% block head %}{% endblock %}
 </head>
 <body>
-    <header>
-        <nav>
-            <a href="/" class="logo">Physics QA Generator</a>
-            <div class="nav-links">
-                <a href="/">Dashboard</a>
-                <a href="/api/output" target="_blank">API</a>
-            </div>
-        </nav>
-    </header>
-
-    <main>
-        {% block content %}{% endblock %}
-    </main>
-
-    <footer>
-        <p>Synthetic Graduate-Level Physics QA System</p>
-    </footer>
-
+    {% block content %}{% endblock %}
     {% block scripts %}{% endblock %}
 </body>
 </html>

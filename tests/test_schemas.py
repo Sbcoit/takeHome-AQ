@@ -6,103 +6,82 @@ from pydantic import ValidationError
 from src.models.schemas import (
     PhysicsQADataPoint,
     Rubric,
-    RubricCriterion,
+    KeyStep,
+    FinalAnswer,
     ValidationResult,
     GenerationStats,
     PhysicsTopic,
 )
 
 
-class TestRubricCriterion:
-    """Tests for RubricCriterion model."""
-
-    def test_valid_criterion(self):
-        """Test creating a valid criterion."""
-        criterion = RubricCriterion(
-            criterion="Test criterion",
-            max_points=20,
-            description="Test description",
-        )
-        assert criterion.criterion == "Test criterion"
-        assert criterion.max_points == 20
-        assert criterion.description == "Test description"
-
-    def test_empty_criterion_fails(self):
-        """Test that empty criterion name fails."""
-        with pytest.raises(ValidationError):
-            RubricCriterion(
-                criterion="",
-                max_points=20,
-                description="Test description",
-            )
-
-    def test_negative_points_fails(self):
-        """Test that negative points fail."""
-        with pytest.raises(ValidationError):
-            RubricCriterion(
-                criterion="Test",
-                max_points=-5,
-                description="Test",
-            )
-
-
 class TestRubric:
     """Tests for Rubric model."""
 
-    def test_valid_rubric(self):
-        """Test creating a valid rubric."""
-        rubric = Rubric(
-            total_points=100,
-            criteria=[
-                RubricCriterion(criterion="A", max_points=25, description="D1"),
-                RubricCriterion(criterion="B", max_points=25, description="D2"),
-                RubricCriterion(criterion="C", max_points=25, description="D3"),
-                RubricCriterion(criterion="D", max_points=25, description="D4"),
+    @pytest.fixture
+    def valid_rubric_data(self):
+        """Fixture for valid rubric data."""
+        return {
+            "final_answer": {
+                "value": "E = mc^2",
+                "points": 3,
+                "tolerance": "equivalent symbolic forms accepted",
+                "common_errors": ["Missing factor of 2", "Wrong sign"]
+            },
+            "key_steps": [
+                {"step": "Apply conservation of energy", "points": 2},
+                {"step": "Apply conservation of momentum", "points": 2},
+                {"step": "Solve algebraically for final answer", "points": 3}
             ],
-            passing_threshold=60,
-        )
-        assert rubric.total_points == 100
-        assert len(rubric.criteria) == 4
-        assert rubric.passing_threshold == 60
+            "partial_credit_rules": ["Correct method but arithmetic error: deduct 1-2 points"],
+            "automatic_zero": ["Uses completely wrong method for the problem type"]
+        }
 
-    def test_criteria_must_sum_to_total(self):
-        """Test that criteria points must sum to total_points."""
-        with pytest.raises(ValidationError) as exc_info:
-            Rubric(
-                total_points=100,
-                criteria=[
-                    RubricCriterion(criterion="A", max_points=30, description="D1"),
-                    RubricCriterion(criterion="B", max_points=30, description="D2"),
-                    RubricCriterion(criterion="C", max_points=30, description="D3"),
-                ],
-                passing_threshold=60,
-            )
-        assert "must equal total_points" in str(exc_info.value)
+    def test_valid_rubric(self, valid_rubric_data):
+        """Test creating a valid rubric."""
+        rubric = Rubric(**valid_rubric_data)
+        assert rubric.total_points == 10
+        assert rubric.final_answer.value == "E = mc^2"
+        assert rubric.final_answer.points == 3
+        assert len(rubric.key_steps) == 3
+        assert sum(step.points for step in rubric.key_steps) == 7
 
-    def test_min_criteria_required(self):
-        """Test that minimum criteria are required."""
+    def test_key_steps_points_validation(self, valid_rubric_data):
+        """Test that key steps must sum to 5-9 points."""
+        # Too few points
+        valid_rubric_data["key_steps"] = [
+            {"step": "Step 1", "points": 1},
+            {"step": "Step 2", "points": 1},
+            {"step": "Step 3", "points": 1}
+        ]
+        with pytest.raises(ValidationError):
+            Rubric(**valid_rubric_data)
+
+    def test_key_steps_minimum_count(self, valid_rubric_data):
+        """Test that at least 3 key steps are required."""
+        valid_rubric_data["key_steps"] = [
+            {"step": "Step 1", "points": 3},
+            {"step": "Step 2", "points": 4}
+        ]
+        with pytest.raises(ValidationError):
+            Rubric(**valid_rubric_data)
+
+    def test_key_steps_maximum_count(self, valid_rubric_data):
+        """Test that at most 7 key steps are allowed."""
+        valid_rubric_data["key_steps"] = [
+            {"step": f"Step {i}", "points": 1} for i in range(8)
+        ]
+        with pytest.raises(ValidationError):
+            Rubric(**valid_rubric_data)
+
+    def test_final_answer_required(self):
+        """Test that final_answer is required."""
         with pytest.raises(ValidationError):
             Rubric(
-                total_points=50,
-                criteria=[
-                    RubricCriterion(criterion="A", max_points=25, description="D1"),
-                    RubricCriterion(criterion="B", max_points=25, description="D2"),
-                ],
-                passing_threshold=30,
-            )
-
-    def test_passing_threshold_validation(self):
-        """Test that passing threshold must be valid."""
-        with pytest.raises(ValidationError):
-            Rubric(
-                total_points=100,
-                criteria=[
-                    RubricCriterion(criterion="A", max_points=25, description="D1"),
-                    RubricCriterion(criterion="B", max_points=25, description="D2"),
-                    RubricCriterion(criterion="C", max_points=25, description="D3"),
-                    RubricCriterion(criterion="D", max_points=25, description="D4"),
-                ],
-                passing_threshold=150,  # Exceeds total
+                key_steps=[
+                    {"step": "Step 1", "points": 2},
+                    {"step": "Step 2", "points": 2},
+                    {"step": "Step 3", "points": 3}
+                ]
             )
 
 
@@ -117,14 +96,19 @@ class TestPhysicsQADataPoint:
             "response_answer": "E_n = hbar * omega * (n + 1/2)",
             "response_reasoning": "Starting with the Schrodinger equation... " * 20,
             "rubric": {
-                "total_points": 100,
-                "criteria": [
-                    {"criterion": "Setup", "max_points": 25, "description": "D1"},
-                    {"criterion": "Math", "max_points": 30, "description": "D2"},
-                    {"criterion": "Answer", "max_points": 25, "description": "D3"},
-                    {"criterion": "Units", "max_points": 20, "description": "D4"},
+                "final_answer": {
+                    "value": "E_n = hbar * omega * (n + 1/2)",
+                    "points": 3,
+                    "tolerance": "equivalent symbolic forms accepted",
+                    "common_errors": ["Missing 1/2 term", "Wrong coefficient"]
+                },
+                "key_steps": [
+                    {"step": "Set up the Schrodinger equation for harmonic potential", "points": 2},
+                    {"step": "Apply appropriate boundary conditions", "points": 2},
+                    {"step": "Solve for energy eigenvalues", "points": 3}
                 ],
-                "passing_threshold": 60,
+                "partial_credit_rules": ["Correct method but arithmetic error: deduct 1-2 points"],
+                "automatic_zero": ["Uses completely wrong method for the problem type"]
             },
             "response_images": [],
         }

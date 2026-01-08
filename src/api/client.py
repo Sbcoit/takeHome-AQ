@@ -211,9 +211,16 @@ class OpenRouterClient:
                 "sort": "throughput",  # Prioritize faster providers
             }
 
-        # Model-specific settings for unreliable models
+        # Model-specific settings for unreliable models or rate-limited models
         is_grok = "grok" in model.lower()
-        model_retry_multiplier = 2.0 if is_grok else 1.0  # Longer backoff for Grok
+        is_qwen = "qwen" in model.lower()
+        # Longer backoff for Grok (unreliable) and Qwen (rate-limited)
+        if is_grok:
+            model_retry_multiplier = 2.0
+        elif is_qwen:
+            model_retry_multiplier = 1.5  # Qwen has stricter rate limits
+        else:
+            model_retry_multiplier = 1.0
 
         # OpenAI o-series models only support temperature=1 (default), so omit it
         # For other models, include the temperature parameter
@@ -249,10 +256,13 @@ class OpenRouterClient:
                         f"{base_url}/chat/completions",
                         json=payload,
                     ) as response:
-                        # Handle rate limiting
+                        # Handle rate limiting with exponential backoff
                         if response.status == 429:
-                            retry_after = int(response.headers.get("Retry-After", 5))
-                            wait_time = (retry_after + random.uniform(0, 2)) * model_retry_multiplier
+                            retry_after = int(response.headers.get("Retry-After", 10))
+                            # Exponential backoff: base wait increases with each attempt
+                            exp_backoff = min(2 ** attempt, 60)  # Cap at 60 seconds
+                            base_wait = max(retry_after, exp_backoff)
+                            wait_time = (base_wait + random.uniform(1, 5)) * model_retry_multiplier
                             logger.warning(
                                 f"Rate limited on {model} ({provider}), waiting {wait_time:.1f}s "
                                 f"(attempt {attempt + 1}/{self.max_retries})"

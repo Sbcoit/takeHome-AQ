@@ -3,7 +3,6 @@
 import asyncio
 import logging
 import os
-import sys
 from pathlib import Path
 from typing import Optional
 
@@ -68,20 +67,28 @@ def generate(
         help="Specific topic(s) to generate questions for (can be used multiple times). "
              "Use 'physics-qa topics' to see available topics."
     ),
+    mix_topics: bool = typer.Option(
+        False,
+        "--mix-topics",
+        help="Distribute different topics across parallel workers. "
+             "By default, all workers use the same topic(s)."
+    ),
 ):
-    """Generate and validate physics QA pairs."""
+    """Generate and validate physics QA pairs using parallel workers."""
     setup_logging(verbose)
 
     api_key = get_api_key()
 
     # Format topics for display
     topics_display = ", ".join(topic) if topic else "All topics"
+    mix_display = " (mixed across workers)" if mix_topics else ""
 
     console.print(
         Panel.fit(
             f"[bold blue]Physics QA Generator[/bold blue]\n\n"
             f"Target: [green]{count}[/green] QA pairs\n"
-            f"Topics: [yellow]{topics_display}[/yellow]\n"
+            f"Topics: [yellow]{topics_display}{mix_display}[/yellow]\n"
+            f"Mode: [magenta]Parallel ({count} workers)[/magenta]\n"
             f"Output: [cyan]{output}[/cyan]",
             title="Configuration",
         )
@@ -115,6 +122,7 @@ def generate(
                     output_path=output,
                     progress_callback=progress_callback,
                     topics=topic,
+                    mix_topics=mix_topics,
                 )
 
                 return result
@@ -143,19 +151,30 @@ def generate(
         table.add_column("Metric", style="cyan")
         table.add_column("Value", style="green")
 
+        table.add_row("Mode", "Parallel")
         table.add_row("Total Generated", str(stats.get("total_generated", 0)))
         table.add_row("Passed All Validation", str(stats.get("passed_all", 0)))
         table.add_row("Failed", str(stats.get("failed", 0)))
         table.add_row("Pass Rate", stats.get("pass_rate", "0%"))
 
-        # By stage
+        # Qwen constraint info
+        qwen_info = result.get("qwen_constraint", {})
+        if qwen_info:
+            table.add_row("", "")
+            table.add_row("[bold]Qwen Constraint (5% max easy)[/bold]", "")
+            table.add_row("  Easy Questions", f"{qwen_info.get('easy_questions', 0)}/{qwen_info.get('total_questions', 0)}")
+            table.add_row("  Easy Rate", qwen_info.get("easy_rate", "0%"))
+            table.add_row("  Status", "[green]PASSED[/green]" if qwen_info.get("passed") else "[red]FAILED[/red]")
+
+        # By stage (for sequential mode)
         by_stage = stats.get("by_stage", {})
-        table.add_row("", "")
-        table.add_row("[bold]By Validation Stage[/bold]", "")
-        table.add_row("  Schema", str(by_stage.get("schema", 0)))
-        table.add_row("  Qwen Constraint", str(by_stage.get("qwen_constraint", 0)))
-        table.add_row("  Cross-check", str(by_stage.get("crosscheck", 0)))
-        table.add_row("  Correctness", str(by_stage.get("correctness", 0)))
+        if by_stage:
+            table.add_row("", "")
+            table.add_row("[bold]By Validation Stage[/bold]", "")
+            table.add_row("  Schema", str(by_stage.get("schema", 0)))
+            table.add_row("  Qwen Constraint", str(by_stage.get("qwen_constraint", 0)))
+            table.add_row("  Cross-check", str(by_stage.get("crosscheck", 0)))
+            table.add_row("  Correctness", str(by_stage.get("correctness", 0)))
 
         console.print(table)
 

@@ -23,9 +23,9 @@ class Settings(BaseSettings):
 
     # Model Configuration
     generation_model: str = Field(
-        default="anthropic/claude-opus-4-5-20251101", alias="GENERATION_MODEL"
+        default="anthropic/claude-opus-4", alias="GENERATION_MODEL"
     )
-    judge_model: str = Field(default="anthropic/claude-opus-4-5-20251101", alias="JUDGE_MODEL")
+    judge_model: str = Field(default="anthropic/claude-sonnet-4", alias="JUDGE_MODEL")
     qwen_model: str = Field(default="qwen/qwen3-max", alias="QWEN_MODEL")
 
     # Cross-check models - stored as comma-separated string in env
