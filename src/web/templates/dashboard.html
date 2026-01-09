@@ -27,9 +27,12 @@
                 <div class="field">
                     <label class="lbl">
                         Output File
-                        <span class="tooltip" data-tip="Path where generated QA pairs will be saved in JSONL format.">?</span>
+                        <span class="tooltip" data-tip="Leave empty to auto-generate a timestamped filename, or enter a custom name.">?</span>
                     </label>
-                    <input type="text" name="output_path" value="output/dataset.jsonl">
+                    <div class="output-input-wrapper">
+                        <span class="output-prefix">output/</span>
+                        <input type="text" name="output_path" placeholder="auto (timestamped)" class="output-input">
+                    </div>
                 </div>
                 <div class="field">
                     <label class="lbl">
@@ -109,6 +112,9 @@
             </div>
             <div class="tabs-content">
                 <div class="tab-panel active" id="tab-logs">
+                    <div class="logs-header" hx-get="/partials/logs-header" hx-trigger="every 500ms" hx-swap="innerHTML">
+                        {% include "partials/logs_header.html" %}
+                    </div>
                     <div class="logs-content" id="logs-content" hx-get="/partials/logs" hx-trigger="every 500ms" hx-swap="innerHTML">
                         {% include "partials/logs.html" %}
                     </div>

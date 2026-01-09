@@ -257,6 +257,12 @@ python -m src.main info
 
 # Validate an existing dataset
 python -m src.main validate output/dataset.jsonl
+
+# Export JSONL to Excel (.xlsx) for AI/ML workflows (saves to exports/)
+python -m src.main export output/dataset.jsonl
+
+# Export with custom output path
+python -m src.main export output/dataset.jsonl -o custom_path/my_export.xlsx
 ```
 
 **Execution Model**: Single-threaded async (concurrent I/O). Workers run concurrently on a single thread via asyncio, with concurrency limited by semaphore and rate limiter.
@@ -286,7 +292,8 @@ The web UI provides:
 - Real-time progress monitoring
 - Generation controls (start/stop)
 - Log viewer
-- Browse generated QA pairs
+- Browse generated QA pairs with category filtering (Validated, Pending Audit, Rejected)
+- Export to Excel (.xlsx) for AI/ML workflows
 - Detailed view for each question
 
 ### Output Format
@@ -316,6 +323,38 @@ The output is a JSONL file with one JSON object per line:
   },
   "response_images": []
 }
+```
+
+### Excel Export Format
+
+The system can export JSONL datasets to Excel (.xlsx) format for AI/ML workflows. The Excel format is flattened for easy use with pandas:
+
+| Column | Description |
+|--------|-------------|
+| `row_id` | Unique row identifier (for data lineage) |
+| `topic` | Physics topic category |
+| `query` | The physics question |
+| `response_answer` | Concise answer |
+| `response_reasoning` | Step-by-step derivation |
+| `rubric_total_points` | Total points available |
+| `rubric_final_answer_value` | Expected final answer |
+| `rubric_final_answer_points` | Points for final answer |
+| `rubric_final_answer_tolerance` | Acceptable answer variations |
+| `rubric_common_errors` | Common errors (JSON array) |
+| `rubric_key_steps_count` | Number of key steps |
+| `rubric_key_steps` | Grading steps (JSON array) |
+| `rubric_partial_credit_rules` | Partial credit rules (JSON array) |
+| `rubric_automatic_zero` | Auto-zero conditions (JSON array) |
+
+**Usage with pandas:**
+```python
+import pandas as pd
+import json
+
+df = pd.read_excel("dataset.xlsx")
+
+# Parse nested JSON columns
+df['key_steps'] = df['rubric_key_steps'].apply(json.loads)
 ```
 
 ## Design Decisions & Tradeoffs
@@ -444,6 +483,7 @@ takeHome-AQ/
 │   │   └── pipeline.py            # Pipeline runner with backfill
 │   └── web/
 │       ├── app.py                 # FastAPI app
+│       ├── export.py              # Excel export utilities
 │       ├── templates/             # Jinja2 templates
 │       └── static/                # CSS
 ├── tests/

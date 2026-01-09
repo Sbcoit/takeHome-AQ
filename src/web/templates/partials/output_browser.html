@@ -1,23 +1,91 @@
 <div class="output-files">
-    {% if files %}
-        {% for file in files %}
-        <div class="output-file {% if file.is_current %}current{% endif %}"
-             hx-get="/partials/output-content/{{ file.name }}"
-             hx-target="#output-content"
-             hx-swap="innerHTML"
-             hx-trigger="click">
-            <div class="output-file-info">
-                <span class="output-file-name">{{ file.name }}</span>
-                <span class="output-file-meta">{{ file.modified }}</span>
-            </div>
-            <div class="output-file-stats">
-                <span class="output-file-count">{{ file.count }} pairs</span>
-            </div>
+    {% set has_files = categories.final or categories.generated or categories.failed %}
+    {% set all_files = categories.final + categories.generated + categories.failed %}
+
+    {% if has_files %}
+        <div class="output-filter">
+            <select id="category-filter" onchange="filterOutputFiles(this.value)">
+                <option value="all" selected>All ({{ all_files|length }})</option>
+                <option value="final">Validated ({{ categories.final|length }})</option>
+                <option value="generated">Pending Audit ({{ categories.generated|length }})</option>
+                <option value="failed">Rejected ({{ categories.failed|length }})</option>
+            </select>
         </div>
-        {% endfor %}
+
+        <div class="output-file-list">
+            {% for file in categories.final %}
+            <div class="output-file {% if file.is_current %}current{% endif %}" data-category="final"
+                 hx-get="/partials/output-content/{{ file.name }}"
+                 hx-target="#output-content"
+                 hx-swap="innerHTML"
+                 hx-trigger="click">
+                <div class="output-file-info">
+                    <div class="output-file-name-row">
+                        <span class="output-file-badge final">Validated</span>
+                        <span class="output-file-name">{{ file.name }}</span>
+                    </div>
+                    <span class="output-file-meta">{{ file.modified }}</span>
+                </div>
+                <div class="output-file-stats">
+                    <span class="output-file-count">{{ file.count }} pairs</span>
+                </div>
+            </div>
+            {% endfor %}
+
+            {% for file in categories.generated %}
+            <div class="output-file {% if file.is_current %}current{% endif %}" data-category="generated"
+                 hx-get="/partials/output-content/{{ file.name }}"
+                 hx-target="#output-content"
+                 hx-swap="innerHTML"
+                 hx-trigger="click">
+                <div class="output-file-info">
+                    <div class="output-file-name-row">
+                        <span class="output-file-badge generated">Pending</span>
+                        <span class="output-file-name">{{ file.name }}</span>
+                    </div>
+                    <span class="output-file-meta">{{ file.modified }}</span>
+                </div>
+                <div class="output-file-stats">
+                    <span class="output-file-count">{{ file.count }} pairs</span>
+                </div>
+            </div>
+            {% endfor %}
+
+            {% for file in categories.failed %}
+            <div class="output-file {% if file.is_current %}current{% endif %}" data-category="failed"
+                 hx-get="/partials/output-content/{{ file.name }}"
+                 hx-target="#output-content"
+                 hx-swap="innerHTML"
+                 hx-trigger="click">
+                <div class="output-file-info">
+                    <div class="output-file-name-row">
+                        <span class="output-file-badge failed">Rejected</span>
+                        <span class="output-file-name">{{ file.name }}</span>
+                    </div>
+                    <span class="output-file-meta">{{ file.modified }}</span>
+                </div>
+                <div class="output-file-stats">
+                    <span class="output-file-count">{{ file.count }} pairs</span>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
     {% else %}
     <div class="output-empty">
         No output files yet
     </div>
     {% endif %}
 </div>
+
+<script>
+function filterOutputFiles(category) {
+    var files = document.querySelectorAll('.output-file-list .output-file');
+    files.forEach(function(file) {
+        if (category === 'all' || file.dataset.category === category) {
+            file.style.display = '';
+        } else {
+            file.style.display = 'none';
+        }
+    });
+}
+</script>

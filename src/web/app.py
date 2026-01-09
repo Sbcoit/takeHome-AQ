@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List, Set
 
 from fastapi import FastAPI, Request, BackgroundTasks, HTTPException, Form
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
@@ -562,22 +562,30 @@ async def dashboard(request: Request):
 
     topics = [{"value": t.name.lower(), "label": t.value} for t in PhysicsTopic]
 
-    # Get output files for initial render
+    # Get output files for initial render (categorized)
     output_dir = Path("output")
-    files = []
+    categories = {
+        "final": [],
+        "generated": [],
+        "failed": [],
+    }
+
     if output_dir.exists():
         for f in sorted(output_dir.glob("*.jsonl"), key=lambda x: x.stat().st_mtime, reverse=True):
             stat = f.stat()
             with open(f) as fp:
                 line_count = sum(1 for _ in fp)
-            files.append({
+
+            file_info = {
                 "name": f.name,
                 "path": str(f),
                 "size": stat.st_size,
                 "modified": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
                 "count": line_count,
                 "is_current": str(f) == pipeline_state.output_path,
-            })
+                "category": _categorize_output_file(f.name),
+            }
+            categories[file_info["category"]].append(file_info)
 
     return templates.TemplateResponse(
         "dashboard.html",
@@ -587,7 +595,7 @@ async def dashboard(request: Request):
             "topics": topics,
             "workers": sorted(pipeline_state.active_workers),
             "logs": pipeline_state.logs[-100:],
-            "files": files,
+            "categories": categories,
         }
     )
 
@@ -650,9 +658,17 @@ async def start_generation(
     pipeline_state.run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     pipeline_state.target_count = count
 
-    # Generate unique timestamped filename if not specified
-    if not output_path or output_path == "output/dataset.jsonl":
+    # Generate unique timestamped filename if not specified or empty
+    if not output_path or output_path.strip() == "":
         output_path = generate_unique_output_path()
+    else:
+        # User provided a filename - prepend output/ if not already there
+        output_path = output_path.strip()
+        if not output_path.startswith("output/"):
+            output_path = f"output/{output_path}"
+        # Add .jsonl extension if missing
+        if not output_path.endswith(".jsonl"):
+            output_path = f"{output_path}.jsonl"
 
     pipeline_state.output_path = output_path
 
@@ -806,6 +822,18 @@ async def partial_logs(request: Request):
     )
 
 
+@app.get("/partials/logs-header", response_class=HTMLResponse)
+async def partial_logs_header(request: Request):
+    """Partial template for logs header showing current output file."""
+    return templates.TemplateResponse(
+        "partials/logs_header.html",
+        {
+            "request": request,
+            "state": pipeline_state.to_dict(),
+        }
+    )
+
+
 @app.get("/partials/qa-list", response_class=HTMLResponse)
 async def partial_qa_list(request: Request, limit: int = 10):
     """Partial template for QA list."""
@@ -926,31 +954,80 @@ async def get_output_file_contents(filename: str, limit: int = 20, offset: int =
     })
 
 
+@app.get("/api/export/{filename}")
+async def export_to_excel(filename: str):
+    """Export JSONL file to Excel format for AI/ML workflows."""
+    from .export import parse_jsonl_file, create_excel_workbook
+
+    output_path = Path("output") / filename
+
+    if not output_path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    if not output_path.suffix == ".jsonl":
+        raise HTTPException(status_code=400, detail="Only JSONL files can be exported")
+
+    # Parse JSONL file
+    items = parse_jsonl_file(output_path)
+
+    if not items:
+        raise HTTPException(status_code=400, detail="No valid data to export")
+
+    # Create Excel workbook
+    excel_buffer = create_excel_workbook(items, filename)
+    xlsx_filename = filename.replace(".jsonl", ".xlsx")
+
+    return StreamingResponse(
+        excel_buffer,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{xlsx_filename}"'}
+    )
+
+
+def _categorize_output_file(filename: str) -> str:
+    """Categorize output file by type."""
+    if ".final." in filename:
+        return "final"
+    elif ".failed." in filename:
+        return "failed"
+    else:
+        return "generated"
+
+
 @app.get("/partials/output-browser", response_class=HTMLResponse)
 async def partial_output_browser(request: Request):
     """Partial template for output file browser."""
     output_dir = Path("output")
-    files = []
+
+    # Categorized file lists
+    categories = {
+        "final": [],
+        "generated": [],
+        "failed": [],
+    }
 
     if output_dir.exists():
         for f in sorted(output_dir.glob("*.jsonl"), key=lambda x: x.stat().st_mtime, reverse=True):
             stat = f.stat()
             with open(f) as fp:
                 line_count = sum(1 for _ in fp)
-            files.append({
+
+            file_info = {
                 "name": f.name,
                 "path": str(f),
                 "size": stat.st_size,
                 "modified": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
                 "count": line_count,
                 "is_current": str(f) == pipeline_state.output_path,
-            })
+                "category": _categorize_output_file(f.name),
+            }
+            categories[file_info["category"]].append(file_info)
 
     return templates.TemplateResponse(
         "partials/output_browser.html",
         {
             "request": request,
-            "files": files,
+            "categories": categories,
         }
     )
 

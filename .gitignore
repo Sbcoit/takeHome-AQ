@@ -46,6 +46,7 @@ output/
 *.jsonl
 checkpoints/
 *.checkpoint.json
+exports/
 
 # Testing
 .coverage

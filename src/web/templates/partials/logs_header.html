@@ -1,0 +1,6 @@
+{% if state.is_running and state.output_path %}
+<div class="logs-current-file">
+    <span class="current-file-label">Writing to:</span>
+    <span class="current-file-path">{{ state.output_path }}</span>
+</div>
+{% endif %}

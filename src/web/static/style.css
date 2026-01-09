@@ -226,6 +226,37 @@ body {
     display: flex;
 }
 
+/* Logs header with current file indicator */
+.logs-header {
+    padding: 0 20px;
+    flex-shrink: 0;
+}
+
+.logs-current-file {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    background: rgba(85, 170, 85, 0.08);
+    border: 1px solid rgba(85, 170, 85, 0.2);
+    border-radius: 6px;
+    margin-bottom: 8px;
+}
+
+.current-file-label {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--green);
+}
+
+.current-file-path {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--text);
+}
+
 .logs-content {
     flex: 1;
     overflow-y: auto;
@@ -578,6 +609,52 @@ body {
     color: var(--text-muted);
 }
 
+/* Output file input with prefix */
+.output-input-wrapper {
+    display: flex;
+    align-items: center;
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    transition: border-color 0.2s;
+}
+
+.output-input-wrapper:hover {
+    border-color: rgba(255, 255, 255, 0.12);
+}
+
+.output-input-wrapper:focus-within {
+    border-color: var(--text-muted);
+}
+
+.output-prefix {
+    padding: 10px 0 10px 12px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    color: var(--text-muted);
+    flex-shrink: 0;
+}
+
+.output-input {
+    flex: 1;
+    padding: 10px 12px 10px 0;
+    background: transparent;
+    border: none;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    color: var(--text);
+    min-width: 0;
+}
+
+.output-input:focus {
+    outline: none;
+}
+
+.output-input::placeholder {
+    color: var(--text-muted);
+    font-style: italic;
+}
+
 .field select {
     cursor: pointer;
     appearance: none;
@@ -811,7 +888,83 @@ body {
 .output-files {
     display: flex;
     flex-direction: column;
+    gap: 12px;
+}
+
+/* Filter dropdown */
+.output-filter {
+    margin-bottom: 4px;
+}
+
+.output-filter select {
+    width: 100%;
+    padding: 8px 12px;
+    font-family: 'DM Sans', sans-serif;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text);
+    background: rgba(0, 0, 0, 0.4);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    cursor: pointer;
+    appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23888888' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 10px center;
+}
+
+.output-filter select:hover {
+    border-color: rgba(255, 255, 255, 0.2);
+}
+
+.output-filter select:focus {
+    outline: none;
+    border-color: var(--blue);
+}
+
+.output-filter select option {
+    background: var(--panel);
+    color: var(--text);
+}
+
+/* File list */
+.output-file-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+/* File badges */
+.output-file-name-row {
+    display: flex;
+    align-items: center;
     gap: 8px;
+}
+
+.output-file-badge {
+    font-family: 'DM Sans', sans-serif;
+    font-size: 9px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+    padding: 2px 6px;
+    border-radius: 4px;
+    flex-shrink: 0;
+}
+
+.output-file-badge.final {
+    background: rgba(85, 170, 85, 0.2);
+    color: var(--green);
+}
+
+.output-file-badge.generated {
+    background: rgba(90, 155, 212, 0.2);
+    color: var(--blue);
+}
+
+.output-file-badge.failed {
+    background: rgba(229, 85, 85, 0.2);
+    color: var(--red);
 }
 
 .output-file {
@@ -944,6 +1097,34 @@ body {
 .toggle-btn.active {
     color: var(--text);
     background: rgba(255, 255, 255, 0.1);
+}
+
+/* Export button */
+.btn-export {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 12px;
+    background: rgba(85, 170, 85, 0.12);
+    border: 1px solid rgba(85, 170, 85, 0.3);
+    border-radius: 6px;
+    font-family: 'DM Sans', sans-serif;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--green);
+    text-decoration: none;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    margin-left: 4px;
+}
+
+.btn-export:hover {
+    background: rgba(85, 170, 85, 0.2);
+    border-color: var(--green);
+}
+
+.btn-export svg {
+    flex-shrink: 0;
 }
 
 .output-view-list {

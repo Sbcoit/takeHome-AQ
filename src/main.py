@@ -453,6 +453,89 @@ def topics():
                   f"{sum(len(s) for s in sampler.SUBTOPICS.values())} subtopics[/dim]")
 
 
+@app.command()
+def export(
+    input_file: str = typer.Argument(..., help="Input JSONL file to export"),
+    output: Optional[str] = typer.Option(
+        None,
+        "--output", "-o",
+        help="Output XLSX file path. If not specified, saves to exports/ directory"
+    ),
+):
+    """Export a JSONL dataset to Excel (.xlsx) format.
+
+    Example:
+        physics-qa export output/dataset_20260108_144413.jsonl
+        physics-qa export output/dataset.jsonl -o my_export.xlsx
+    """
+    from .web.export import parse_jsonl_file, create_excel_workbook
+
+    input_path = Path(input_file)
+
+    # Validate input file
+    if not input_path.exists():
+        console.print(f"[red]Error: File not found: {input_file}[/red]")
+        raise typer.Exit(1)
+
+    if not input_path.suffix == ".jsonl":
+        console.print(f"[red]Error: Expected .jsonl file, got {input_path.suffix}[/red]")
+        raise typer.Exit(1)
+
+    # Determine output path
+    if output:
+        output_path = Path(output)
+    else:
+        # Default to exports/ directory
+        exports_dir = Path("exports")
+        exports_dir.mkdir(exist_ok=True)
+        output_path = exports_dir / input_path.with_suffix(".xlsx").name
+
+    # Parse JSONL
+    console.print(f"[dim]Reading {input_file}...[/dim]")
+    items = parse_jsonl_file(input_path)
+
+    if not items:
+        console.print(f"[red]Error: No valid data found in {input_file}[/red]")
+        raise typer.Exit(1)
+
+    # Create Excel
+    console.print(f"[dim]Converting {len(items)} QA pairs to Excel...[/dim]")
+    excel_buffer = create_excel_workbook(items, input_path.name)
+
+    # Write to file
+    with open(output_path, "wb") as f:
+        f.write(excel_buffer.getvalue())
+
+    console.print(f"[green]Exported {len(items)} QA pairs to {output_path}[/green]")
+
+    # Show column info
+    table = Table(title="Excel Columns", show_header=True)
+    table.add_column("Column", style="cyan")
+    table.add_column("Description", style="dim")
+
+    columns = [
+        ("row_id", "Unique row identifier"),
+        ("topic", "Physics topic category"),
+        ("query", "The physics question"),
+        ("response_answer", "Concise answer"),
+        ("response_reasoning", "Step-by-step derivation"),
+        ("rubric_total_points", "Total points available"),
+        ("rubric_final_answer_value", "Expected final answer"),
+        ("rubric_final_answer_points", "Points for final answer"),
+        ("rubric_final_answer_tolerance", "Acceptable answer variations"),
+        ("rubric_common_errors", "Common errors (JSON array)"),
+        ("rubric_key_steps_count", "Number of key steps"),
+        ("rubric_key_steps", "Grading steps (JSON array)"),
+        ("rubric_partial_credit_rules", "Partial credit rules (JSON array)"),
+        ("rubric_automatic_zero", "Auto-zero conditions (JSON array)"),
+    ]
+
+    for col, desc in columns:
+        table.add_row(col, desc)
+
+    console.print(table)
+
+
 def main():
     """Main entry point."""
     app()
