@@ -225,6 +225,26 @@ cp .env.example .env
 #   OPENAI_API_KEY=sk-...
 ```
 
+### Running via Web UI
+
+```bash
+# Start the web server
+python -m src.main serve
+
+# Or with custom host/port
+python -m src.main serve --host 0.0.0.0 --port 8080
+
+# Open browser to http://127.0.0.1:8000
+```
+
+The web UI provides:
+- Real-time progress monitoring
+- Generation controls (start/stop)
+- Log viewer
+- Browse generated QA pairs with category filtering (Validated, Pending Audit, Rejected)
+- Export to Excel (.xlsx) for AI/ML workflows
+- Detailed view for each question
+
 ### Running via CLI
 
 ```bash
@@ -275,26 +295,6 @@ python -m src.main export output/dataset.jsonl -o custom_path/my_export.xlsx
 **Note**: The `output/` directory is **automatically created** when the pipeline runs. When you clone this repo and run the pipeline, it will create the output folder in your project directory - no manual setup required.
 
 **Backfill Behavior**: If you request 10 QAs and Phase 2 rejects 3, the pipeline automatically generates 3 more and validates them until `final.jsonl` has exactly 10.
-
-### Running via Web UI
-
-```bash
-# Start the web server
-python -m src.main serve
-
-# Or with custom host/port
-python -m src.main serve --host 0.0.0.0 --port 8080
-
-# Open browser to http://127.0.0.1:8000
-```
-
-The web UI provides:
-- Real-time progress monitoring
-- Generation controls (start/stop)
-- Log viewer
-- Browse generated QA pairs with category filtering (Validated, Pending Audit, Rejected)
-- Export to Excel (.xlsx) for AI/ML workflows
-- Detailed view for each question
 
 ### Output Format
 
