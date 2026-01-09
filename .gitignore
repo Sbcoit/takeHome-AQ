@@ -42,10 +42,13 @@ ENV/
 .env.*.local
 
 # Output and data
-*.jsonl
 checkpoints/
 *.checkpoint.json
 exports/
+
+# Keep output directory tracked
+!output/
+!output/*.jsonl
 
 # Testing
 .coverage
