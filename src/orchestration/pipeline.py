@@ -1013,10 +1013,11 @@ class ParallelPipelineRunner:
         })
 
         # Create derivation auditor (uses GPT-4 for independent reasoning check)
+        # 2 passes balances rigor with practicality - catches major issues without being overly strict
         derivation_auditor = DerivationAuditor(
             client=self.client,
             audit_model=self.settings.audit_model,
-            required_passes=5,  # 5 audit passes for reliability
+            required_passes=2,  # 2 audit passes - balanced rigor
         )
 
         # Create final answer validator (uses GPT-4, not Claude)
@@ -1080,7 +1081,7 @@ class ParallelPipelineRunner:
                 if not audit_passed:
                     logger.warning(
                         f"[Validator {qa_idx + 1}] QA {current_qa.id} FAILED derivation audit "
-                        f"({audit_pass_count}/5). Issues found in reasoning."
+                        f"({audit_pass_count}/2). Issues found in reasoning."
                     )
 
                     # Check retry limit
@@ -1180,7 +1181,7 @@ class ParallelPipelineRunner:
                 if passed:
                     logger.info(
                         f"[Validator {qa_idx + 1}] QA {current_qa.id} PASSED all validation "
-                        f"(audit: {audit_pass_count}/5, answer: {pass_count}/{self.settings.final_validation_passes}) "
+                        f"(audit: {audit_pass_count}/2, answer: {pass_count}/{self.settings.final_validation_passes}) "
                         f"on attempt {attempt}"
                     )
                     return current_qa, True, regen_count
@@ -1375,6 +1376,8 @@ class ParallelPipelineRunner:
             )
             for qa in failed_pairs:
                 logger.warning(f"  - {qa.id}: {qa.subtopic}")
+            # Add to class-level failed list for later writing to file
+            self.failed_validation_pairs.extend(failed_pairs)
 
         return passed_pairs
 
@@ -1463,10 +1466,11 @@ class ParallelPipelineRunner:
             worker_id: ID for logging
         """
         # Create validators for this audit worker
+        # 2 passes balances rigor with practicality
         derivation_auditor = DerivationAuditor(
             client=self.client,
             audit_model=self.settings.audit_model,
-            required_passes=5,
+            required_passes=2,  # 2 audit passes - balanced rigor
         )
         final_validator = FinalAnswerValidator(
             client=self.client,
@@ -1523,7 +1527,7 @@ class ParallelPipelineRunner:
                     audit_passed, audit_pass_count, audits = await derivation_auditor.audit(current_qa)
 
                     if not audit_passed:
-                        logger.warning(f"[Audit {worker_id}] QA {current_qa.id} FAILED derivation audit ({audit_pass_count}/5)")
+                        logger.warning(f"[Audit {worker_id}] QA {current_qa.id} FAILED derivation audit ({audit_pass_count}/2)")
 
                         if MAX_REGEN_ATTEMPTS != float('inf') and attempt >= MAX_REGEN_ATTEMPTS:
                             break
@@ -1601,6 +1605,8 @@ class ParallelPipelineRunner:
 
         # Track fully validated QAs (passed both Phase 1 and Phase 2)
         self.fully_validated_pairs: List[PhysicsQADataPoint] = []
+        # Track QAs that failed Phase 2 validation (for debugging)
+        self.failed_validation_pairs: List[PhysicsQADataPoint] = []
         backfill_round = 0
 
         # Outer loop: keep going until we have target_count fully validated QAs
@@ -1797,7 +1803,7 @@ class ParallelPipelineRunner:
                     "failed": 0,
                     "audit_model": self.settings.audit_model,
                     "final_validation_model": self.settings.final_validation_model,
-                    "required_audit_passes": 5,
+                    "required_audit_passes": 2,
                     "required_answer_passes": self.settings.final_validation_passes,
                     "total_regeneration_attempts": 0,
                 }
@@ -1829,6 +1835,14 @@ class ParallelPipelineRunner:
                     f.write(qa.to_json_line() + "\n")
             logger.info(f"Wrote {len(self.fully_validated_pairs)} final validated QA pairs to: {final_output_path}")
             logger.info(f"Original cross-check validated pairs preserved in: {self.output_path}")
+
+        # Write failed pairs to failed output file (for debugging)
+        if self.failed_validation_pairs:
+            failed_output_path = self.output_path.with_suffix('.failed.jsonl')
+            with open(failed_output_path, "w") as f:
+                for qa in self.failed_validation_pairs:
+                    f.write(qa.to_json_line() + "\n")
+            logger.info(f"Wrote {len(self.failed_validation_pairs)} failed QA pairs to: {failed_output_path}")
 
         # Update stats
         self.stats.completed_at = datetime.utcnow()

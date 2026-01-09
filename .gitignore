@@ -42,7 +42,6 @@ ENV/
 .env.*.local
 
 # Output and data
-output/
 *.jsonl
 checkpoints/
 *.checkpoint.json
